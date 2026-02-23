@@ -12,17 +12,24 @@ pub struct AppState {
     pub started_at: Instant,
     pub cache: Arc<CacheLayer>,
     pub registry: Registry,
+    pub job_engine: Arc<soroban_batch::engine::JobEngine>,
     pub is_shutting_down: Arc<AtomicBool>,
 }
 
 impl AppState {
-    pub fn new(db: PgPool, registry: Registry, is_shutting_down: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        db: PgPool,
+        registry: Registry,
+        job_engine: Arc<soroban_batch::engine::JobEngine>,
+        is_shutting_down: Arc<AtomicBool>,
+    ) -> Self {
         let config = CacheConfig::from_env();
         Self {
             db,
             started_at: Instant::now(),
             cache: Arc::new(CacheLayer::new(config)),
             registry,
+            job_engine,
             is_shutting_down,
         }
     }
