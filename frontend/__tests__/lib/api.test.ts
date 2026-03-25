@@ -60,6 +60,21 @@ test('getNetworks: returns network metadata from /networks', async () => {
   expect(fetchMock.mock.calls[0][0]).toBe(`${API_URL}/networks`);
 });
 
+test('getContractSearchSuggestions: returns autocomplete results', async () => {
+  const mock = {
+    items: [
+      { text: 'Token Factory', kind: 'contract', score: 1.0 },
+      { text: 'DeFi', kind: 'category', score: 0.81 },
+    ],
+  };
+
+  fetchMock.mockResponseOnce(JSON.stringify(mock), { status: 200 });
+
+  const res = await api.getContractSearchSuggestions('tok');
+  expect(res.items).toHaveLength(2);
+  expect((fetchMock.mock.calls[0][0] as string)).toContain('/api/contracts/suggestions?q=tok');
+});
+
 test('getContract: success and 404 error handling', async () => {
   const contract = { id: 'c2', contract_id: 'c2', wasm_hash: '', name: 'B', publisher_id: 'p2', network: 'testnet', is_verified: true, tags: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() };
   fetchMock.mockResponseOnce(JSON.stringify(contract), { status: 200 });

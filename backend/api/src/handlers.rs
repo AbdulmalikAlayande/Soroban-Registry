@@ -20,7 +20,8 @@ use shared::{
     DeploymentStats, InteractionTimeSeriesPoint, InteractionTimeSeriesResponse,
     InteractionsListResponse, InteractionsQueryParams, InteractorStats, Network, NetworkConfig,
     NetworkEndpoints, NetworkInfo, NetworkListResponse, NetworkStatus, PaginatedResponse,
-    PublishRequest, Publisher, SemVer, TimelineEntry, TopUser, TrendingParams,
+    PublishRequest, Publisher, SearchSuggestion, SearchSuggestionsResponse, SemVer, TimelineEntry,
+    TopUser, TrendingParams,
     UpdateContractMetadataRequest, UpdateContractStatusRequest, VerifyRequest,
 };
 use std::time::Duration;
@@ -106,6 +107,32 @@ const NETWORKS_REFRESH_INTERVAL_SECS: u64 = 60;
 const NETWORK_DEGRADED_FAILURE_THRESHOLD: i32 = 1;
 const NETWORK_OFFLINE_FAILURE_THRESHOLD: i32 = 5;
 const NETWORK_STALE_AFTER_MINUTES: i64 = 10;
+const SLOW_SEARCH_QUERY_THRESHOLD_MS: u128 = 200;
+
+fn observe_search_query(
+    kind: &str,
+    started_at: std::time::Instant,
+    query: Option<&str>,
+    limit: i64,
+) {
+    let elapsed = started_at.elapsed();
+    crate::metrics::SEARCH_QUERY_DURATION
+        .with_label_values(&[kind])
+        .observe(elapsed.as_secs_f64());
+
+    if elapsed.as_millis() > SLOW_SEARCH_QUERY_THRESHOLD_MS {
+        crate::metrics::SEARCH_SLOW_QUERIES
+            .with_label_values(&[kind])
+            .inc();
+        tracing::warn!(
+            query_type = kind,
+            duration_ms = elapsed.as_millis(),
+            query = query.unwrap_or(""),
+            limit = limit,
+            "slow search query detected"
+        );
+    }
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct IndexerStateSnapshot {
@@ -708,6 +735,105 @@ pub async fn list_networks(State(state): State<AppState>) -> ApiResult<Json<Netw
     Ok(Json(response))
 }
 
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct SearchSuggestionsQuery {
+    pub q: String,
+    #[serde(default = "default_search_suggestion_limit")]
+    pub limit: i64,
+}
+
+fn default_search_suggestion_limit() -> i64 {
+    8
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/contracts/suggestions",
+    params(SearchSuggestionsQuery),
+    responses(
+        (status = 200, description = "Autocomplete suggestions for contract search", body = SearchSuggestionsResponse)
+    ),
+    tag = "Contracts"
+)]
+pub async fn get_contract_search_suggestions(
+    State(state): State<AppState>,
+    Query(query): Query<SearchSuggestionsQuery>,
+) -> ApiResult<Json<SearchSuggestionsResponse>> {
+    let started_at = std::time::Instant::now();
+    let limit = query.limit.clamp(1, 20);
+    let normalized = query.q.trim().to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return Ok(Json(SearchSuggestionsResponse { items: Vec::new() }));
+    }
+
+    let cache_key = format!("suggestions:{}:{}", normalized, limit);
+    if let (Some(cached), true) = state.cache.get("search", &cache_key).await {
+        if let Ok(payload) = serde_json::from_str::<SearchSuggestionsResponse>(&cached) {
+            observe_search_query("suggestions", started_at, Some(&query.q), limit);
+            return Ok(Json(payload));
+        }
+    }
+
+    let prefix = format!("{}%", normalized);
+    let rows: Vec<(String, String, f64)> = sqlx::query_as(
+        r#"
+        WITH candidates AS (
+            SELECT DISTINCT ON (lower(name))
+                name AS text,
+                'contract' AS kind,
+                GREATEST(
+                    similarity(lower(name), $1),
+                    CASE WHEN lower(name) LIKE $2 THEN 1.0 ELSE 0.0 END
+                ) AS score
+            FROM contracts
+            WHERE lower(name) LIKE $2 OR lower(name) % $1
+
+            UNION ALL
+
+            SELECT DISTINCT ON (lower(category))
+                category AS text,
+                'category' AS kind,
+                GREATEST(
+                    similarity(lower(category), $1),
+                    CASE WHEN lower(category) LIKE $2 THEN 0.95 ELSE 0.0 END
+                ) AS score
+            FROM contracts
+            WHERE category IS NOT NULL
+              AND (lower(category) LIKE $2 OR lower(category) % $1)
+        )
+        SELECT text, kind, score
+        FROM candidates
+        WHERE text IS NOT NULL
+        ORDER BY score DESC, length(text), text
+        LIMIT $3
+        "#,
+    )
+    .bind(&normalized)
+    .bind(&prefix)
+    .bind(limit)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch search suggestions", err))?;
+
+    let response = SearchSuggestionsResponse {
+        items: rows
+            .into_iter()
+            .map(|(text, kind, score)| SearchSuggestion { text, kind, score })
+            .collect(),
+    };
+
+    if let Ok(serialized) = serde_json::to_string(&response) {
+        state
+            .cache
+            .put("search", &cache_key, serialized, Some(Duration::from_secs(60)))
+            .await;
+    }
+
+    observe_search_query("suggestions", started_at, Some(&query.q), limit);
+    Ok(Json(response))
+}
+
 /// List and search contracts
 #[utoipa::path(
     get,
@@ -723,6 +849,7 @@ pub async fn list_contracts(
     State(state): State<AppState>,
     params: Result<Query<ContractSearchParams>, QueryRejection>,
 ) -> axum::response::Response {
+    let search_started_at = std::time::Instant::now();
     let Query(params) = match params {
         Ok(q) => q,
         Err(err) => return map_query_rejection(err).into_response(),
@@ -771,18 +898,13 @@ pub async fn list_contracts(
     let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM contracts c WHERE 1=1");
 
     if let Some(ref q) = params.query {
-        let pattern = format!("%{}%", q);
-        query.push(" AND (c.name ILIKE ");
-        query.push_bind(&pattern);
-        query.push(" OR c.description ILIKE ");
-        query.push_bind(&pattern);
-        query.push(")");
+        query.push(" AND contracts_build_tsquery(");
+        query.push_bind(q);
+        query.push(") @@ c.search_document");
 
-        count_query.push(" AND (c.name ILIKE ");
-        count_query.push_bind(&pattern);
-        count_query.push(" OR c.description ILIKE ");
-        count_query.push_bind(&pattern);
-        count_query.push(")");
+        count_query.push(" AND contracts_build_tsquery(");
+        count_query.push_bind(q);
+        count_query.push(") @@ c.search_document");
     }
 
     if params.verified_only.unwrap_or(false) {
@@ -917,13 +1039,14 @@ pub async fn list_contracts(
         }
         shared::SortBy::Relevance => {
             if let Some(ref q) = params.query {
-                let exact = q.clone();
-                let contains = format!("%{}%", q);
-                query.push(" ORDER BY CASE WHEN c.name ILIKE ");
-                query.push_bind(&exact);
-                query.push(" THEN 0 WHEN c.name ILIKE ");
-                query.push_bind(&contains);
-                query.push(" THEN 1 ELSE 2 END ");
+                let prefix = format!("{}%", q.to_ascii_lowercase());
+                query.push(" ORDER BY (CASE WHEN lower(c.name) = lower(");
+                query.push_bind(q);
+                query.push(") THEN 3.0 WHEN lower(c.name) LIKE ");
+                query.push_bind(&prefix);
+                query.push(" THEN 1.5 ELSE 0.0 END + ts_rank_cd(c.search_document, contracts_build_tsquery(");
+                query.push_bind(q);
+                query.push("), 32)) ");
                 query.push(direction);
                 query.push(", c.id ");
                 query.push(id_direction);
@@ -950,6 +1073,10 @@ pub async fn list_contracts(
         Ok(v) => v,
         Err(err) => return db_internal_error("count filtered contracts", err).into_response(),
     };
+
+    if params.query.is_some() {
+        observe_search_query("contracts", search_started_at, params.query.as_deref(), limit);
+    }
 
     let mut response = PaginatedResponse::new(contracts, total, page, limit);
 

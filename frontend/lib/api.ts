@@ -222,6 +222,16 @@ export interface ContractSearchParams {
   sort_order?: 'asc' | 'desc';
 }
 
+export interface SearchSuggestion {
+  text: string;
+  kind: string;
+  score: number;
+}
+
+export interface SearchSuggestionsResponse {
+  items: SearchSuggestion[];
+}
+
 export interface PublishRequest {
   contract_id: string;
   name: string;
@@ -617,6 +627,43 @@ export const api = {
       return { ...data, items: raw.contracts as Contract[] };
     }
     return data;
+  },
+
+  async getContractSearchSuggestions(
+    q: string,
+    limit = 8,
+  ): Promise<SearchSuggestionsResponse> {
+    if (USE_MOCKS) {
+      const lowered = q.trim().toLowerCase();
+      if (!lowered) {
+        return { items: [] };
+      }
+
+      const items = Array.from(
+        new Set(
+          MOCK_CONTRACTS
+            .flatMap((contract) => [contract.name, contract.category].filter(Boolean))
+            .filter((value: string) => value.toLowerCase().includes(lowered)),
+        ),
+      )
+        .slice(0, limit)
+        .map((text) => ({
+          text,
+          kind: MOCK_CONTRACTS.some((contract) => contract.name === text) ? 'contract' : 'category',
+          score: 1,
+        }));
+
+      return { items };
+    }
+
+    const params = new URLSearchParams();
+    params.set("q", q);
+    params.set("limit", String(limit));
+
+    return handleApiCall<SearchSuggestionsResponse>(
+      () => fetch(`${API_URL}/api/contracts/suggestions?${params.toString()}`),
+      "/api/contracts/suggestions",
+    );
   },
 
   async getContract(id: string, network?: Network): Promise<ContractGetResponse> {

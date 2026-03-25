@@ -444,6 +444,18 @@ pub struct ContractSearchParams {
     pub last_accessed_to: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SearchSuggestion {
+    pub text: String,
+    pub kind: String,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct SearchSuggestionsResponse {
+    pub items: Vec<SearchSuggestion>,
+}
+
 /// Pagination params for contract versions (limit/offset style)
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct VersionPaginationParams {

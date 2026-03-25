@@ -564,77 +564,70 @@ print(f'Fetched {len(all_contracts)} contracts')
 
 ## Full-Text Search
 
-Powerful search capabilities with relevance ranking.
+Contract search is powered by PostgreSQL full-text indexes over `name`, `category`, and `description`.
 
 ### Basic Search
 
 ```http
-GET /api/contracts/search?query=token transfer
+GET /api/contracts?query=token transfer
 ```
 
-### Advanced Search
+### Advanced Search Syntax
+
+The `query` parameter supports operator-aware parsing via PostgreSQL web-style search:
 
 ```http
-POST /api/contracts/search
-Content-Type: application/json
+# Exact phrase
+GET /api/contracts?query="token factory"
 
-{
-  "query": "stellar token",
-  "fields": ["name", "description", "tags"],
-  "filters": {
-    "network": "mainnet",
-    "verified": true
-  },
-  "sort": {
-    "by": "_score",
-    "order": "desc"
-  },
-  "limit": 20,
-  "highlight": true
-}
+# Required and excluded terms
+GET /api/contracts?query=token -deprecated
+
+# Phrase with additional required term
+GET /api/contracts?query="liquidity pool" soroban
+```
+
+**Supported Patterns:**
+
+| Pattern | Description | Example |
+|---------|-------------|---------|
+| Phrase | Exact word sequence | `"token contract"` |
+| Required terms | Terms must appear | `stellar token` |
+| Excluded terms | Terms must not appear | `token -legacy` |
+| Prefix term | Prefix match for a token | `token*` |
+
+### Relevance Ranking
+
+When `sort_by=relevance` or when `query` is present without an explicit sort, matches are ranked by:
+
+- Weighted full-text score across `name`, `category`, and `description`
+- Exact contract name matches boosted above partial matches
+- Prefix name matches boosted above generic body matches
+
+### Search Suggestions
+
+Use the suggestions endpoint to power autocomplete UIs:
+
+```http
+GET /api/contracts/suggestions?q=tok&limit=8
 ```
 
 **Response:**
 ```json
 {
-  "results": [
-    {
-      "contract_id": "CDLZFC3...",
-      "name": "Stellar Token Contract",
-      "description": "A token implementation...",
-      "score": 8.5,
-      "highlights": {
-        "name": ["<em>Stellar</em> <em>Token</em> Contract"],
-        "description": ["A <em>token</em> implementation for <em>Stellar</em>"]
-      }
-    }
-  ],
-  "total": 42,
-  "took_ms": 23
+  "items": [
+    { "text": "Token Factory", "kind": "contract", "score": 1.0 },
+    { "text": "Token", "kind": "category", "score": 0.82 }
+  ]
 }
 ```
 
-**Search Features:**
+### Performance and Monitoring
 
-| Feature | Description | Example |
-|---------|-------------|---------|
-| **Phrase search** | Exact phrase | `"token contract"` |
-| **Wildcards** | Pattern matching | `token*` matches token, tokens |
-| **Boolean** | AND/OR/NOT | `token AND (stellar OR soroban)` |
-| **Fuzzy** | Typo tolerance | `tokn~` matches token |
-| **Boost** | Field importance | `name:token^2 description:token` |
-
-**Relevance Scoring:**
-
-Results are ranked by relevance (0-10):
-- Higher scores = better matches
-- Considers term frequency, field length, field boosts
-- Verified contracts get slight boost (+0.5)
-
-**Performance:**
-- Average search: < 50ms
-- Complex queries: < 200ms
-- Supports ~1M+ contracts efficiently
+- Search uses generated `tsvector` columns plus GIN indexes for low-latency ranking
+- Autocomplete uses prefix and trigram indexes on contract names and categories
+- Search requests slower than 200ms are logged and counted in Prometheus metrics
+- Suggestion responses are cached briefly to keep selector/autocomplete latency low
 
 ---
 

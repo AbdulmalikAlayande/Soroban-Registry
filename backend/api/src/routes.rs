@@ -33,6 +33,10 @@ pub fn contract_routes() -> Router<AppState> {
             get(handlers::list_contracts).post(handlers::publish_contract),
         )
         .route(
+            "/api/contracts/suggestions",
+            get(handlers::get_contract_search_suggestions),
+        )
+        .route(
             "/api/contracts/trending",
             get(handlers::get_trending_contracts),
         )
