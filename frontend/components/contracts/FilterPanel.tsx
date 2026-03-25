@@ -1,7 +1,3 @@
-import { ContractSearchParams } from '@/lib/api';
-
-type NetworkFilter = NonNullable<ContractSearchParams['network']>;
-
 interface FilterPanelProps {
   categories: string[];
   selectedCategories: string[];
@@ -9,8 +5,6 @@ interface FilterPanelProps {
   languages: string[];
   selectedLanguages: string[];
   onToggleLanguage: (value: string) => void;
-  selectedNetworks: NetworkFilter[];
-  onToggleNetwork: (value: NetworkFilter) => void;
   author: string;
   onAuthorChange: (value: string) => void;
   verifiedOnly: boolean;
@@ -55,15 +49,11 @@ export function FilterPanel({
   languages,
   selectedLanguages,
   onToggleLanguage,
-  selectedNetworks,
-  onToggleNetwork,
   author,
   onAuthorChange,
   verifiedOnly,
   onVerifiedChange,
 }: FilterPanelProps) {
-  const networks: NetworkFilter[] = ['mainnet', 'testnet', 'futurenet'];
-
   return (
     <div className="space-y-5">
       <CheckboxGroup
@@ -79,25 +69,6 @@ export function FilterPanel({
         selected={selectedLanguages}
         onToggle={onToggleLanguage}
       />
-
-      <div>
-        <p className="text-sm font-medium text-foreground mb-2">Network</p>
-        <div className="space-y-2">
-          {networks.map((network) => (
-            <label key={network} className="flex items-center gap-2 cursor-pointer group">
-              <input
-                type="checkbox"
-                checked={selectedNetworks.includes(network)}
-                onChange={() => onToggleNetwork(network)}
-                className="rounded border-border text-primary focus:ring-ring bg-background"
-              />
-              <span className="text-sm capitalize text-muted-foreground group-hover:text-foreground transition-colors">
-                {network}
-              </span>
-            </label>
-          ))}
-        </div>
-      </div>
 
       <div>
         <label className="block text-sm font-medium text-foreground mb-2">

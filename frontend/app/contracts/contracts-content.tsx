@@ -1,12 +1,13 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api, ContractSearchParams, Contract } from '@/lib/api';
 import ContractCard from '@/components/ContractCard';
 import ContractCardSkeleton from '@/components/ContractCardSkeleton';
 import { ActiveFilters } from '@/components/contracts/ActiveFilters';
 import { FilterPanel } from '@/components/contracts/FilterPanel';
+import { ALL_NETWORK_FILTERS, NetworkSelectorDropdown } from '@/components/contracts/NetworkSelectorDropdown';
 import { ResultsCount } from '@/components/contracts/ResultsCount';
 import { SearchBar } from '@/components/contracts/SearchBar';
 import { SortDropdown, SortBy } from '@/components/contracts/SortDropdown';
@@ -32,6 +33,7 @@ const LANGUAGE_OPTIONS = [
   'AssemblyScript',
   'Move',
 ];
+const NETWORK_PREFERENCE_KEY = 'soroban-registry.contract-network-preferences';
 
 function parseCsvOrMulti(values: string[]) {
   return values
@@ -61,6 +63,10 @@ function toggleOne<T>(values: T[], value: T) {
     : [...values, value];
 }
 
+function isAllNetworksSelected(values: NonNullable<ContractSearchParams['network']>[]) {
+  return values.length === ALL_NETWORK_FILTERS.length;
+}
+
 type ContractsUiFilters = {
   query: string;
   categories: string[];
@@ -78,10 +84,11 @@ function getInitialFilters(searchParams: URLSearchParams): ContractsUiFilters {
   const query = searchParams.get('query') || searchParams.get('q') || '';
   const categories = parseCsvOrMulti(searchParams.getAll('category'));
   const languages = parseCsvOrMulti(searchParams.getAll('language'));
-  const networks = parseCsvOrMulti(searchParams.getAll('network')).filter(
+  const parsedNetworks = parseCsvOrMulti(searchParams.getAll('network')).filter(
     (network): network is NonNullable<ContractSearchParams['network']> =>
       network === 'mainnet' || network === 'testnet' || network === 'futurenet',
   );
+  const networks = parsedNetworks.length > 0 ? parsedNetworks : [...ALL_NETWORK_FILTERS];
 
   const sortBy = searchParams.get('sort_by') as SortBy;
   const sortOrder = searchParams.get('sort_order') as 'asc' | 'desc';
@@ -111,6 +118,7 @@ export function ContractsContent() {
   const lastSearchSignatureRef = useRef<string>('');
 
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false);
+  const [preferencesReady, setPreferencesReady] = useState(false);
 
   const [filters, setFilters] = useState<ContractsUiFilters>(() =>
     getInitialFilters(new URLSearchParams(searchParams.toString())),
@@ -119,11 +127,51 @@ export function ContractsContent() {
   const debouncedQuery = useDebouncedValue(filters.query, 300);
 
   useEffect(() => {
+    if (typeof window === 'undefined') {
+      return;
+    }
+
+    const hasNetworkQuery = searchParams.getAll('network').length > 0;
+    if (hasNetworkQuery) {
+      setPreferencesReady(true);
+      return;
+    }
+
+    const savedValue = window.localStorage.getItem(NETWORK_PREFERENCE_KEY);
+    if (!savedValue) {
+      setPreferencesReady(true);
+      return;
+    }
+
+    try {
+      const parsedValue = JSON.parse(savedValue);
+      if (Array.isArray(parsedValue)) {
+        const savedNetworks = parsedValue.filter(
+          (network): network is NonNullable<ContractSearchParams['network']> =>
+            ALL_NETWORK_FILTERS.includes(network),
+        );
+
+        setFilters((current) => ({ ...current, networks: savedNetworks }));
+      }
+    } catch {
+      window.localStorage.removeItem(NETWORK_PREFERENCE_KEY);
+    } finally {
+      setPreferencesReady(true);
+    }
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (!preferencesReady) {
+      return;
+    }
+
     const params = new URLSearchParams();
     if (debouncedQuery) params.set('query', debouncedQuery);
     filters.categories.forEach((category) => params.append('category', category));
     filters.languages.forEach((language) => params.append('language', language));
-    filters.networks.forEach((network) => params.append('network', network));
+    if (!isAllNetworksSelected(filters.networks)) {
+      filters.networks.forEach((network) => params.append('network', network));
+    }
     if (filters.author) params.set('author', filters.author);
     if (filters.verified_only) params.set('verified_only', 'true');
     if (filters.sort_by) params.set('sort_by', filters.sort_by);
@@ -133,7 +181,20 @@ export function ContractsContent() {
 
     const next = params.toString();
     router.replace(next ? `${pathname}?${next}` : pathname, { scroll: false });
-  }, [debouncedQuery, filters, pathname, router]);
+  }, [debouncedQuery, filters, pathname, preferencesReady, router]);
+
+  useEffect(() => {
+    if (!preferencesReady || typeof window === 'undefined') {
+      return;
+    }
+
+    window.localStorage.setItem(
+      NETWORK_PREFERENCE_KEY,
+      JSON.stringify(filters.networks),
+    );
+  }, [filters.networks, preferencesReady]);
+
+  const shouldFilterByNetwork = filters.networks.length > 0 && !isAllNetworksSelected(filters.networks);
 
   const apiParams = useMemo<ContractSearchParams>(
     () => ({
@@ -141,23 +202,40 @@ export function ContractsContent() {
       categories: filters.categories.length > 0 ? filters.categories : undefined,
       languages: filters.languages.length > 0 ? filters.languages : undefined,
       author: filters.author || undefined,
-      networks: filters.networks.length > 0 ? filters.networks : undefined,
+      networks: shouldFilterByNetwork ? filters.networks : undefined,
       verified_only: filters.verified_only,
       sort_by: filters.sort_by,
       sort_order: filters.sort_order,
       page: filters.page,
       page_size: filters.page_size,
     }),
-    [debouncedQuery, filters],
+    [debouncedQuery, filters, shouldFilterByNetwork],
   );
 
   const { data, isLoading, isFetching } = useQuery({
     queryKey: ['contracts', apiParams],
     queryFn: () => api.getContracts(apiParams),
+    enabled: preferencesReady && filters.networks.length > 0,
     placeholderData: (previousData) => previousData,
   });
 
+  const effectiveData = useMemo(
+    () =>
+      filters.networks.length === 0
+        ? {
+            items: [],
+            total: 0,
+            page: filters.page,
+            page_size: filters.page_size,
+            total_pages: 0,
+          }
+        : data,
+    [data, filters.page, filters.page_size, filters.networks.length],
+  );
+
   useEffect(() => {
+    if (!preferencesReady) return;
+
     const payload = {
       keyword: debouncedQuery || '',
       categories: filters.categories,
@@ -174,7 +252,7 @@ export function ContractsContent() {
       Boolean(payload.keyword) ||
       payload.categories.length > 0 ||
       payload.languages.length > 0 ||
-      payload.networks.length > 0 ||
+      !isAllNetworksSelected(payload.networks) ||
       Boolean(payload.author) ||
       payload.verified_only ||
       payload.sort_by !== 'created_at' ||
@@ -187,7 +265,7 @@ export function ContractsContent() {
     lastSearchSignatureRef.current = signature;
 
     logEvent('search_performed', payload);
-  }, [debouncedQuery, filters, logEvent]);
+  }, [debouncedQuery, filters, logEvent, preferencesReady]);
 
   const clearAllFilters = () =>
     setFilters((current) => ({
@@ -196,7 +274,7 @@ export function ContractsContent() {
       categories: [],
       languages: [],
       author: '',
-      networks: [],
+      networks: [...ALL_NETWORK_FILTERS],
       verified_only: false,
       sort_by: 'created_at',
       sort_order: 'desc',
@@ -240,18 +318,20 @@ export function ContractsContent() {
       }),
     );
 
-    filters.networks.forEach((network) =>
-      chips.push({
-        id: `network:${network}`,
-        label: `Network: ${network}`,
-        onRemove: () =>
-          setFilters((current) => ({
-            ...current,
-            networks: removeOne(current.networks, network),
-            page: 1,
-          })),
-      }),
-    );
+    if (!isAllNetworksSelected(filters.networks)) {
+      filters.networks.forEach((network) =>
+        chips.push({
+          id: `network:${network}`,
+          label: `Network: ${network}`,
+          onRemove: () =>
+            setFilters((current) => ({
+              ...current,
+              networks: removeOne(current.networks, network),
+              page: 1,
+            })),
+        }),
+      );
+    }
 
     if (filters.author) {
       chips.push({
@@ -301,14 +381,6 @@ export function ContractsContent() {
           page: 1,
         }))
       }
-      selectedNetworks={filters.networks}
-      onToggleNetwork={(value) =>
-        setFilters((current) => ({
-          ...current,
-          networks: toggleOne(current.networks, value),
-          page: 1,
-        }))
-      }
       author={filters.author}
       onAuthorChange={(value) =>
         setFilters((current) => ({ ...current, author: value, page: 1 }))
@@ -333,17 +405,38 @@ export function ContractsContent() {
 
       <div className="bg-background rounded-xl border border-border p-6 mb-8 shadow-sm">
         <div className="flex flex-col gap-4">
-          <SearchBar
-            value={filters.query}
-            onChange={(value) => setFilters((current) => ({ ...current, query: value, page: 1 }))}
-            onClear={() => {
-              logEvent('search_performed', {
-                keyword: '',
-                action: 'clear_query',
-              });
-              setFilters((current) => ({ ...current, query: '', page: 1 }));
-            }}
-          />
+          <div className="flex flex-col gap-3 lg:flex-row">
+            <div className="min-w-0 flex-1">
+              <SearchBar
+                value={filters.query}
+                onChange={(value) => setFilters((current) => ({ ...current, query: value, page: 1 }))}
+                onClear={() => {
+                  logEvent('search_performed', {
+                    keyword: '',
+                    action: 'clear_query',
+                  });
+                  setFilters((current) => ({ ...current, query: '', page: 1 }));
+                }}
+              />
+            </div>
+            <NetworkSelectorDropdown
+              selectedNetworks={filters.networks}
+              onToggleNetwork={(value) =>
+                setFilters((current) => ({
+                  ...current,
+                  networks: toggleOne(current.networks, value),
+                  page: 1,
+                }))
+              }
+              onSelectAll={() =>
+                setFilters((current) => ({
+                  ...current,
+                  networks: [...ALL_NETWORK_FILTERS],
+                  page: 1,
+                }))
+              }
+            />
+          </div>
 
           <div className="flex flex-wrap items-center gap-3">
             <SortDropdown
@@ -416,7 +509,7 @@ export function ContractsContent() {
         </div>
       )}
 
-      {isLoading ? (
+      {!preferencesReady || isLoading ? (
         <>
           <div className="mb-4">
             <div className="h-6 w-48 bg-gray-200 dark:bg-gray-800 rounded animate-pulse" />
@@ -427,19 +520,19 @@ export function ContractsContent() {
             ))}
           </div>
         </>
-      ) : data && data.items.length > 0 ? (
+      ) : effectiveData && effectiveData.items.length > 0 ? (
         <>
           <div className="mb-4">
-            <ResultsCount visibleCount={data.items.length} totalCount={data.total} />
+            <ResultsCount visibleCount={effectiveData.items.length} totalCount={effectiveData.total} />
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
-            {data.items.map((contract: Contract) => (
+            {effectiveData.items.map((contract: Contract) => (
               <ContractCard key={contract.id} contract={contract} />
             ))}
           </div>
 
-          {data.total_pages > 1 && (
+          {effectiveData.total_pages > 1 && (
             <div className="flex items-center justify-center gap-2">
               <button
                 onClick={() =>
@@ -452,14 +545,14 @@ export function ContractsContent() {
               </button>
 
               <span className="text-sm text-muted-foreground">
-                Page {filters.page} of {data.total_pages}
+                Page {filters.page} of {effectiveData.total_pages}
               </span>
 
               <button
                 onClick={() =>
                   setFilters((current) => ({ ...current, page: current.page + 1 }))
                 }
-                disabled={filters.page >= data.total_pages}
+                disabled={filters.page >= effectiveData.total_pages}
                 className="px-4 py-2 rounded-lg border border-border text-foreground disabled:opacity-50 disabled:cursor-not-allowed hover:bg-accent transition-colors"
               >
                 Next
