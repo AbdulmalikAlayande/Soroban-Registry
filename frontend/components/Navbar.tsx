@@ -208,9 +208,6 @@ export default function Navbar() {
         return () => window.removeEventListener('keydown', onKey);
     }, []);
 
-    const isActive = (href: string) => pathname === href;
-    const isExploreActive = ['/publishers', '/stats', '/templates', '/analytics'].some(p => pathname.startsWith(p));
-
     const isActive = useCallback((href: string) => pathname === href, [pathname]);
     const isExploreActive = EXPLORE_LINKS.some(l => pathname.startsWith(l.href));
 

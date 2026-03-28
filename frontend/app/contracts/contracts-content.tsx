@@ -199,7 +199,7 @@ export function ContractsContent() {
     router.replace(next ? `${pathname}?${next}` : pathname, { scroll: false });
   }, [query, categories, languages, tags, networks, author, verified_only, sort_by, sort_order, page, page_size, pathname, router]);
 
-  const { data, isLoading, isFetching } = useQuery<Awaited<ReturnType<typeof api.getContracts>>>({
+  const { data: allContracts, isLoading, isFetching } = useQuery<Awaited<ReturnType<typeof api.getContracts>>>({
     queryKey: ['contracts', apiParams],
     queryFn: () => api.getContracts(apiParams),
     placeholderData: (previousData) => previousData ?? EMPTY_CONTRACTS_RESPONSE,
