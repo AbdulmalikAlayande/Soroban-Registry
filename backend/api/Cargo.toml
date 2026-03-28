@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 shared = { path = "../shared" }
 verifier = { path = "../verifier" }
-
 soroban-batch = { path = "../../soroban-registry/crates/soroban-batch" }
 axum = { workspace = true, features = ["ws"] }
 tower = { workspace = true }
