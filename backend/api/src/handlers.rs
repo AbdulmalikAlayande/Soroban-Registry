@@ -11,6 +11,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::{json, Value};
+use sqlx::QueryBuilder;
 use shared::{
     pagination::Cursor, AnalyticsEventType, AuditActionType, ChangePublisherRequest, Contract,
     ContractAnalyticsResponse, ContractAuditLog, ContractChangelogEntry, ContractChangelogResponse,
@@ -59,6 +60,44 @@ fn map_query_rejection(err: QueryRejection) -> ApiError {
         "InvalidQuery",
         format!("Invalid query parameters: {}", err.body_text()),
     )
+}
+
+fn sort_timestamp_column(sort_by: &shared::SortBy) -> Option<&'static str> {
+    match sort_by {
+        shared::SortBy::CreatedAt => Some("c.created_at"),
+        shared::SortBy::UpdatedAt => Some("c.updated_at"),
+        shared::SortBy::VerifiedAt => Some("c.verified_at"),
+        shared::SortBy::LastAccessedAt => Some("c.last_accessed_at"),
+        _ => None,
+    }
+}
+
+fn contract_timestamp_for_sort(contract: &Contract, sort_by: &shared::SortBy) -> Option<chrono::DateTime<chrono::Utc>> {
+    match sort_by {
+        shared::SortBy::CreatedAt => Some(contract.created_at),
+        shared::SortBy::UpdatedAt => Some(contract.updated_at),
+        shared::SortBy::VerifiedAt => contract.verified_at,
+        shared::SortBy::LastAccessedAt => contract.last_accessed_at,
+        _ => None,
+    }
+}
+
+async fn track_contract_access(state: &AppState, contract_id: Uuid) {
+    let cache_key = contract_id.to_string();
+    if !state.cache.should_refresh_contract_access(&cache_key).await {
+        return;
+    }
+
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        if let Err(err) = sqlx::query("UPDATE contracts SET last_accessed_at = NOW() WHERE id = $1")
+            .bind(contract_id)
+            .execute(&db)
+            .await
+        {
+            tracing::warn!(contract_id = %contract_id, error = ?err, "failed to refresh contract last_accessed_at");
+        }
+    });
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, sqlx::Type)]
@@ -462,121 +501,205 @@ pub async fn list_contracts(
         }
     });
     let sort_order = params.sort_order.clone().unwrap_or(shared::SortOrder::Desc);
-
-    let is_timestamp_sort = matches!(sort_by, shared::SortBy::CreatedAt);
-
-    // Build dynamic query with aggregations
-    let mut query = String::from(
-        "SELECT c.*
-         FROM contracts c
-         LEFT JOIN contract_interactions ci ON c.id = ci.contract_id
-         LEFT JOIN contract_versions cv ON c.id = cv.contract_id
-         WHERE 1=1",
-    );
-    let mut count_query = String::from("SELECT COUNT(*) FROM contracts WHERE 1=1");
-
-    if let Some(ref q) = params.query {
-        let search_clause = format!(
-            " AND (c.name ILIKE '%{}%' OR c.description ILIKE '%{}%')",
-            q, q
-        );
-        query.push_str(&search_clause);
-        count_query.push_str(&search_clause);
-    }
-
-    if let Some(verified) = params.verified_only {
-        if verified {
-            query.push_str(" AND c.is_verified = true");
-            count_query.push_str(" AND is_verified = true");
-        }
-    }
-
-    if let Some(ref category) = params.category {
-        let category_clause = format!(" AND c.category = '{}'", category);
-        query.push_str(&category_clause);
-        count_query.push_str(&category_clause);
-    }
-
-    // Filter by network(s) (Issue #43)
     let network_list = params
         .networks
         .as_ref()
         .filter(|n| !n.is_empty())
         .cloned()
         .or_else(|| params.network.map(|n| vec![n]));
+
+    let timestamp_sort_column = sort_timestamp_column(&sort_by);
+    let direction = if sort_order == shared::SortOrder::Asc { "ASC" } else { "DESC" };
+    let direction_op = if sort_order == shared::SortOrder::Asc { ">" } else { "<" };
+    let id_direction = if sort_order == shared::SortOrder::Asc { "ASC" } else { "DESC" };
+
+    let mut query = QueryBuilder::new(
+        "SELECT c.* \
+         FROM contracts c \
+         LEFT JOIN contract_interactions ci ON c.id = ci.contract_id \
+         LEFT JOIN contract_versions cv ON c.id = cv.contract_id \
+         WHERE 1=1",
+    );
+
+    let mut count_query = QueryBuilder::new("SELECT COUNT(*) FROM contracts c WHERE 1=1");
+
+    if let Some(ref q) = params.query {
+        let pattern = format!("%{}%", q);
+        query.push(" AND (c.name ILIKE ");
+        query.push_bind(&pattern);
+        query.push(" OR c.description ILIKE ");
+        query.push_bind(&pattern);
+        query.push(")");
+
+        count_query.push(" AND (c.name ILIKE ");
+        count_query.push_bind(&pattern);
+        count_query.push(" OR c.description ILIKE ");
+        count_query.push_bind(&pattern);
+        count_query.push(")");
+    }
+
+    if params.verified_only.unwrap_or(false) {
+        query.push(" AND c.is_verified = true");
+        count_query.push(" AND c.is_verified = true");
+    }
+
+    if let Some(ref category) = params.category {
+        query.push(" AND c.category = ");
+        query.push_bind(category);
+        count_query.push(" AND c.category = ");
+        count_query.push_bind(category);
+    }
+
     if let Some(ref nets) = network_list {
-        let net_list: Vec<String> = nets.iter().map(|n| n.to_string()).collect();
-        let in_clause = net_list
-            .iter()
-            .map(|s| format!("'{}'", s.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let network_clause = format!(" AND c.network IN ({})", in_clause);
-        query.push_str(&network_clause);
-        count_query.push_str(&network_clause);
+        query.push(" AND c.network IN (");
+        let mut separated = query.separated(", ");
+        for net in nets {
+            separated.push_bind(net);
+        }
+        separated.push_unseparated(")");
+
+        count_query.push(" AND c.network IN (");
+        let mut separated = count_query.separated(", ");
+        for net in nets {
+            separated.push_bind(net);
+        }
+        separated.push_unseparated(")");
     }
 
-    // Apply cursor filter if available and sorting by timestamp
-    if let Some(cursor) = cursor {
-        if is_timestamp_sort {
-            let direction_op = if sort_order == shared::SortOrder::Asc {
-                ">"
-            } else {
-                "<"
-            };
-            let cursor_clause = format!(
-                " AND (c.created_at {} '{}' OR (c.created_at = '{}' AND c.id {} '{}'))",
-                direction_op,
-                cursor.timestamp.to_rfc3339(),
-                cursor.timestamp.to_rfc3339(),
-                direction_op,
-                cursor.id
-            );
-            query.push_str(&cursor_clause);
+    if let Some(created_from) = params.created_from {
+        query.push(" AND c.created_at >= ");
+        query.push_bind(created_from);
+        count_query.push(" AND c.created_at >= ");
+        count_query.push_bind(created_from);
+    }
+
+    if let Some(created_to) = params.created_to {
+        query.push(" AND c.created_at <= ");
+        query.push_bind(created_to);
+        count_query.push(" AND c.created_at <= ");
+        count_query.push_bind(created_to);
+    }
+
+    if let Some(updated_from) = params.updated_from {
+        query.push(" AND c.updated_at >= ");
+        query.push_bind(updated_from);
+        count_query.push(" AND c.updated_at >= ");
+        count_query.push_bind(updated_from);
+    }
+
+    if let Some(updated_to) = params.updated_to {
+        query.push(" AND c.updated_at <= ");
+        query.push_bind(updated_to);
+        count_query.push(" AND c.updated_at <= ");
+        count_query.push_bind(updated_to);
+    }
+
+    if let Some(verified_from) = params.verified_from {
+        query.push(" AND c.verified_at >= ");
+        query.push_bind(verified_from);
+        count_query.push(" AND c.verified_at >= ");
+        count_query.push_bind(verified_from);
+    }
+
+    if let Some(verified_to) = params.verified_to {
+        query.push(" AND c.verified_at <= ");
+        query.push_bind(verified_to);
+        count_query.push(" AND c.verified_at <= ");
+        count_query.push_bind(verified_to);
+    }
+
+    if let Some(last_accessed_from) = params.last_accessed_from {
+        query.push(" AND c.last_accessed_at >= ");
+        query.push_bind(last_accessed_from);
+        count_query.push(" AND c.last_accessed_at >= ");
+        count_query.push_bind(last_accessed_from);
+    }
+
+    if let Some(last_accessed_to) = params.last_accessed_to {
+        query.push(" AND c.last_accessed_at <= ");
+        query.push_bind(last_accessed_to);
+        count_query.push(" AND c.last_accessed_at <= ");
+        count_query.push_bind(last_accessed_to);
+    }
+
+    if let Some(ref cursor) = cursor {
+        if let Some(column) = timestamp_sort_column {
+            query.push(" AND (");
+            query.push(column);
+            query.push(" ");
+            query.push(direction_op);
+            query.push(" ");
+            query.push_bind(cursor.timestamp);
+            query.push(" OR (");
+            query.push(column);
+            query.push(" = ");
+            query.push_bind(cursor.timestamp);
+            query.push(" AND c.id ");
+            query.push(direction_op);
+            query.push(" ");
+            query.push_bind(cursor.id);
+            query.push("))");
         }
     }
 
-    query.push_str(" GROUP BY c.id");
+    query.push(" GROUP BY c.id");
 
-    // Sorting logic using aggregations in ORDER BY
-    let order_by = match sort_by {
-        shared::SortBy::CreatedAt => "c.created_at".to_string(),
-        shared::SortBy::UpdatedAt => "c.updated_at".to_string(),
+    match sort_by {
+        shared::SortBy::CreatedAt
+        | shared::SortBy::UpdatedAt
+        | shared::SortBy::VerifiedAt
+        | shared::SortBy::LastAccessedAt => {
+            query.push(" ORDER BY ");
+            query.push(timestamp_sort_column.unwrap_or("c.created_at"));
+            query.push(" ");
+            query.push(direction);
+            query.push(" NULLS LAST, c.id ");
+            query.push(id_direction);
+        }
         shared::SortBy::Popularity | shared::SortBy::Interactions => {
-            "COUNT(DISTINCT ci.id)".to_string()
+            query.push(" ORDER BY COUNT(DISTINCT ci.id) ");
+            query.push(direction);
+            query.push(", c.id ");
+            query.push(id_direction);
         }
-        shared::SortBy::Deployments => "COUNT(DISTINCT cv.id)".to_string(),
+        shared::SortBy::Deployments => {
+            query.push(" ORDER BY COUNT(DISTINCT cv.id) ");
+            query.push(direction);
+            query.push(", c.id ");
+            query.push(id_direction);
+        }
         shared::SortBy::Relevance => {
             if let Some(ref q) = params.query {
-                format!(
-                    "CASE WHEN c.name ILIKE '{}' THEN 0
-                          WHEN c.name ILIKE '%{}%' THEN 1
-                          ELSE 2 END",
-                    q, q
-                )
+                let exact = q.clone();
+                let contains = format!("%{}%", q);
+                query.push(" ORDER BY CASE WHEN c.name ILIKE ");
+                query.push_bind(&exact);
+                query.push(" THEN 0 WHEN c.name ILIKE ");
+                query.push_bind(&contains);
+                query.push(" THEN 1 ELSE 2 END ");
+                query.push(direction);
+                query.push(", c.id ");
+                query.push(id_direction);
             } else {
-                "c.created_at".to_string()
+                query.push(" ORDER BY c.created_at ");
+                query.push(direction);
+                query.push(", c.id ");
+                query.push(id_direction);
             }
         }
-    };
+    }
 
-    let direction = if sort_order == shared::SortOrder::Asc {
-        "ASC"
-    } else {
-        "DESC"
-    };
+    query.push(" LIMIT ");
+    query.push_bind(limit);
+    query.push(" OFFSET ");
+    query.push_bind(offset);
 
-    query.push_str(&format!(
-        " ORDER BY {} {}, c.id DESC LIMIT {} OFFSET {}",
-        order_by, direction, limit, offset
-    ));
-
-    let contracts: Vec<Contract> = match sqlx::query_as(&query).fetch_all(&state.db).await {
+    let contracts: Vec<Contract> = match query.build_query_as().fetch_all(&state.db).await {
         Ok(rows) => rows,
         Err(err) => return db_internal_error("list contracts", err).into_response(),
     };
 
-    let total: i64 = match sqlx::query_scalar(&count_query).fetch_one(&state.db).await {
+    let total: i64 = match count_query.build_query_scalar().fetch_one(&state.db).await {
         Ok(v) => v,
         Err(err) => return db_internal_error("count filtered contracts", err).into_response(),
     };
@@ -586,8 +709,10 @@ pub async fn list_contracts(
     // Generate next cursor if we have full page
     if response.items.len() >= limit as usize {
         if let Some(last) = response.items.last() {
-            let next_cursor = Cursor::new(last.created_at, last.id).encode();
-            response.next_cursor = Some(next_cursor);
+            if let Some(timestamp) = contract_timestamp_for_sort(last, &sort_by) {
+                let next_cursor = Cursor::new(timestamp, last.id).encode();
+                response.next_cursor = Some(next_cursor);
+            }
         }
     }
 
@@ -595,8 +720,10 @@ pub async fn list_contracts(
     // (Simplification: if we have a cursor, or page > 1)
     if params.cursor.is_some() || page > 1 {
         if let Some(first) = response.items.first() {
-            let prev_cursor = Cursor::new(first.created_at, first.id).encode();
-            response.prev_cursor = Some(prev_cursor);
+            if let Some(timestamp) = contract_timestamp_for_sort(first, &sort_by) {
+                let prev_cursor = Cursor::new(timestamp, first.id).encode();
+                response.prev_cursor = Some(prev_cursor);
+            }
         }
     }
 
@@ -659,6 +786,8 @@ pub async fn get_contract(
     } else {
         None
     };
+
+    track_contract_access(&state, contract.id).await;
 
     Ok(Json(ContractGetResponse {
         contract,
@@ -1972,7 +2101,7 @@ pub async fn verify_contract(
             .map_err(|err| db_internal_error("mark verification as verified", err))?;
 
             sqlx::query(
-                "UPDATE contracts SET is_verified = true, updated_at = NOW() WHERE id = $1",
+                "UPDATE contracts SET is_verified = true, verified_at = NOW(), updated_at = NOW() WHERE id = $1",
             )
             .bind(contract.id)
             .execute(&state.db)
@@ -2474,9 +2603,16 @@ pub async fn update_contract_status(
     .await
     .map_err(|err| db_internal_error("insert status verification row", err))?;
 
-    sqlx::query("UPDATE contracts SET is_verified = $2, updated_at = NOW() WHERE id = $1")
+    let verified_at = if is_verified_after {
+        Some(chrono::Utc::now())
+    } else {
+        contract.verified_at
+    };
+
+    sqlx::query("UPDATE contracts SET is_verified = $2, verified_at = COALESCE($3, verified_at), updated_at = NOW() WHERE id = $1")
         .bind(contract_uuid)
         .bind(is_verified_after)
+        .bind(verified_at)
         .execute(&state.db)
         .await
         .map_err(|err| db_internal_error("update contract verification flag from status", err))?;
@@ -3122,5 +3258,46 @@ mod tests {
         assert_eq!(new["status"], "verified");
         assert_eq!(new["verification_id"], "abc123");
         assert_eq!(new["_ip_address"], "unknown");
+    }
+
+    #[test]
+    fn timestamp_sort_helpers_cover_all_timestamp_fields() {
+        let now = chrono::Utc::now();
+        let contract = Contract {
+            id: Uuid::nil(),
+            contract_id: "C123".to_string(),
+            wasm_hash: "hash".to_string(),
+            name: "Demo".to_string(),
+            description: None,
+            publisher_id: Uuid::nil(),
+            network: Network::Testnet,
+            is_verified: true,
+            category: None,
+            tags: Vec::new(),
+            created_at: now,
+            updated_at: now + chrono::TimeDelta::seconds(10),
+            verified_at: Some(now + chrono::TimeDelta::seconds(20)),
+            last_accessed_at: Some(now + chrono::TimeDelta::seconds(30)),
+            health_score: 0,
+            is_maintenance: false,
+            logical_id: None,
+            network_configs: None,
+        };
+
+        assert_eq!(sort_timestamp_column(&shared::SortBy::CreatedAt), Some("c.created_at"));
+        assert_eq!(sort_timestamp_column(&shared::SortBy::UpdatedAt), Some("c.updated_at"));
+        assert_eq!(sort_timestamp_column(&shared::SortBy::VerifiedAt), Some("c.verified_at"));
+        assert_eq!(
+            sort_timestamp_column(&shared::SortBy::LastAccessedAt),
+            Some("c.last_accessed_at")
+        );
+        assert_eq!(
+            contract_timestamp_for_sort(&contract, &shared::SortBy::VerifiedAt),
+            contract.verified_at
+        );
+        assert_eq!(
+            contract_timestamp_for_sort(&contract, &shared::SortBy::LastAccessedAt),
+            contract.last_accessed_at
+        );
     }
 }

@@ -23,6 +23,8 @@ pub struct Contract {
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub verified_at: Option<DateTime<Utc>>,
+    pub last_accessed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub health_score: i32,
     #[serde(default)]
@@ -359,6 +361,8 @@ pub struct VerifyRequest {
 pub enum SortBy {
     CreatedAt,
     UpdatedAt,
+    VerifiedAt,
+    LastAccessedAt,
     Popularity,
     Deployments,
     Interactions,
@@ -390,6 +394,14 @@ pub struct ContractSearchParams {
     pub sort_by: Option<SortBy>,
     pub sort_order: Option<SortOrder>,
     pub cursor: Option<String>,
+    pub created_from: Option<DateTime<Utc>>,
+    pub created_to: Option<DateTime<Utc>>,
+    pub updated_from: Option<DateTime<Utc>>,
+    pub updated_to: Option<DateTime<Utc>>,
+    pub verified_from: Option<DateTime<Utc>>,
+    pub verified_to: Option<DateTime<Utc>>,
+    pub last_accessed_from: Option<DateTime<Utc>>,
+    pub last_accessed_to: Option<DateTime<Utc>>,
 }
 
 /// Pagination params for contract versions (limit/offset style)
