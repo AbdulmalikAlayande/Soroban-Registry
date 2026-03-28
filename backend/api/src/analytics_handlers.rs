@@ -359,13 +359,19 @@ pub async fn get_analytics_summary(
         r#"
         SELECT
             c.network::TEXT,
-            COUNT(DISTINCT c.id)::BIGINT                            AS contract_count,
+            COUNT(DISTINCT c.id)::BIGINT                              AS contract_count,
             COUNT(DISTINCT c.id) FILTER (WHERE c.is_verified)::BIGINT AS verified_count,
-            COALESCE(SUM(agg.count), 0)::BIGINT                    AS total_interactions,
-            COALESCE(SUM(c.view_count), 0)::BIGINT                 AS total_views
+            COALESCE(SUM(agg.total_count), 0)::BIGINT                 AS total_interactions,
+            COALESCE(SUM(c.view_count), 0)::BIGINT                    AS total_views
         FROM contracts c
-        LEFT JOIN contract_interaction_daily_aggregates agg
-               ON agg.contract_id = c.id
+        LEFT JOIN (
+            SELECT
+                contract_id,
+                SUM(count) AS total_count
+            FROM contract_interaction_daily_aggregates
+            GROUP BY contract_id
+        ) agg
+            ON agg.contract_id = c.id
         GROUP BY c.network
         ORDER BY total_interactions DESC
         "#,
