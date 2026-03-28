@@ -1,6 +1,6 @@
 'use client';
 
-import { Package, GitBranch, ChevronDown, BarChart2, Users, Menu, X, Layers, Search, Plus, Bell, Columns2, ShieldCheck, PieChart, TrendingUp, LogOut, Settings, Zap, Code2, User } from 'lucide-react';
+import { Package, GitBranch, ChevronDown, BarChart2, Users, Menu, X, Layers, Search, Plus, Columns2, ShieldCheck, PieChart, TrendingUp, LogOut, Settings, Zap, Code2, User } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import React, { useState, useRef, useEffect, useCallback } from 'react';
@@ -43,6 +43,7 @@ function useScrolled(threshold = 8) {
     return scrolled;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function useTrapFocus(ref: React.RefObject<HTMLElement | null>, active: boolean) {
     useEffect(() => {
         if (!active || !ref.current) return;
@@ -179,7 +180,7 @@ export default function Navbar() {
 
     const [mobileOpen,    setMobileOpen]    = useState(false);
     const [exploreOpen,   setExploreOpen]   = useState(false);
-    const [profileOpen,   setProfileOpen]   = useState(false);
+    const [, setProfileOpen]   = useState(false);
     const [searchOpen,    setSearchOpen]    = useState(false);
 
     const exploreTimeout = useRef<NodeJS.Timeout | null>(null);

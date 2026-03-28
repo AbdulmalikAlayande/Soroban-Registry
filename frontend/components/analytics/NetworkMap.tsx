@@ -27,8 +27,6 @@ const REGION_COORDS: Record<string, { x: number; y: number }> = {
 const NetworkMap: React.FC<NetworkMapProps> = ({ data }) => {
   const [hovered, setHovered] = useState<string | null>(null);
 
-  const maxCount = Math.max(...data.map((d) => d.count), 1);
-
   const grouped = data.reduce<Record<string, NetworkRegionPoint[]>>((acc, d) => {
     if (!acc[d.region]) acc[d.region] = [];
     acc[d.region].push(d);

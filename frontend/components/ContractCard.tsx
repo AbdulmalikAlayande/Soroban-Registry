@@ -27,10 +27,6 @@ export default function ContractCard({ contract }: ContractCardProps) {
     futurenet: "bg-purple-500",
   };
 
-  const creator =
-    contract.publisher_id.length > 14
-      ? `${contract.publisher_id.slice(0, 8)}...${contract.publisher_id.slice(-4)}`
-      : contract.publisher_id;
   const address = `${contract.contract_id.slice(0, 8)}...${contract.contract_id.slice(-6)}`;
   const categoryLabel = contract.category || "uncategorized";
   const deploymentCount =

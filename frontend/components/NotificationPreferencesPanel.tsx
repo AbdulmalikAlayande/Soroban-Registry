@@ -1,8 +1,6 @@
 'use client';
 
-import { useState } from 'react';
 import { useNotificationPreferences } from '@/hooks/useNotificationPreferences';
-import { Bell, Check } from 'lucide-react';
 
 export default function NotificationPreferencesPanel() {
   const {
