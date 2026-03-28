@@ -25,6 +25,33 @@ import {
 
 export type Network = "mainnet" | "testnet" | "futurenet";
 
+export type NetworkStatus = "online" | "offline" | "degraded";
+
+export interface NetworkEndpoints {
+  rpc_url: string;
+  health_url: string;
+  explorer_url: string;
+  friendbot_url?: string;
+}
+
+export interface NetworkInfo {
+  id: string;
+  name: string;
+  network_type: Network;
+  status: NetworkStatus;
+  endpoints: NetworkEndpoints;
+  last_checked_at: string;
+  last_indexed_ledger_height?: number;
+  last_indexed_at?: string;
+  consecutive_failures: number;
+  status_message?: string;
+}
+
+export interface NetworkListResponse {
+  networks: NetworkInfo[];
+  cached_at: string;
+}
+
 /** Per-network config (Issue #43) */
 export interface NetworkConfig {
   contract_id: string;
@@ -50,6 +77,8 @@ export interface Contract {
   logo_url?: string;
   created_at: string;
   updated_at: string;
+  verified_at?: string;
+  last_accessed_at?: string;
   is_maintenance?: boolean;
   /** Logical contract grouping (Issue #43) */
   logical_id?: string;
@@ -140,71 +169,23 @@ export interface ContractVersion {
   created_at: string;
 }
 
-export interface PerformanceBenchmark {
-  id: string;
+export interface ContractAbiResponse {
+  abi: unknown;
+}
+
+export interface ContractChangelogEntry {
+  version: string;
+  created_at: string;
+  commit_hash?: string;
+  source_url?: string;
+  release_notes?: string;
+  breaking: boolean;
+  breaking_changes: string[];
+}
+
+export interface ContractChangelogResponse {
   contract_id: string;
-  contract_version_id?: string | null;
-  version?: string | null;
-  benchmark_name: string;
-  execution_time_ms: number;
-  gas_used: number;
-  sample_size: number;
-  source: string;
-  recorded_at: string;
-  metadata?: Record<string, unknown> | null;
-}
-
-export interface PerformanceMetricSnapshot {
-  metric_type: string;
-  benchmark_name?: string | null;
-  latest_value: number;
-  previous_value?: number | null;
-  change_percent?: number | null;
-  recorded_at: string;
-}
-
-export interface PerformanceTrendPoint {
-  bucket_start: string;
-  bucket_end: string;
-  benchmark_name: string;
-  avg_execution_time_ms: number;
-  avg_gas_used: number;
-  sample_count: number;
-}
-
-export interface PerformanceRegression {
-  benchmark_name: string;
-  current_version?: string | null;
-  previous_version?: string | null;
-  execution_time_regression_percent?: number | null;
-  gas_regression_percent?: number | null;
-  severity: string;
-  detected_at: string;
-}
-
-export interface PerformanceComparisonEntry {
-  contract_id: string;
-  contract_name: string;
-  category?: string | null;
-  benchmark_name: string;
-  avg_execution_time_ms: number;
-  avg_gas_used: number;
-  sample_count: number;
-}
-
-export interface ContractPerformanceSummary {
-  contract_id: string;
-  latest_benchmarks: PerformanceBenchmark[];
-  metric_snapshots: PerformanceMetricSnapshot[];
-  trends: PerformanceTrendPoint[];
-  regressions: PerformanceRegression[];
-  comparisons: PerformanceComparisonEntry[];
-  unresolved_alerts: Array<{
-    id: string;
-    severity: string;
-    message?: string | null;
-    triggered_at: string;
-  }>;
+  entries: ContractChangelogEntry[];
 }
 
 export interface Publisher {
@@ -258,6 +239,16 @@ export interface ContractSearchParams {
   page_size?: number;
   sort_by?: 'name' | 'created_at' | 'updated_at' | 'popularity' | 'deployments' | 'interactions' | 'relevance' | 'downloads';
   sort_order?: 'asc' | 'desc';
+}
+
+export interface SearchSuggestion {
+  text: string;
+  kind: string;
+  score: number;
+}
+
+export interface SearchSuggestionsResponse {
+  items: SearchSuggestion[];
 }
 
 export interface PublishRequest {
@@ -379,29 +370,6 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:3001";
 const USE_MOCKS = process.env.NEXT_PUBLIC_USE_MOCKS === "true";
 
 /**
- * Helper to create a mock response with a delay
- */
-function _mockResponse<T>(data: T, delay = 300): Promise<T> {
-  return new Promise((resolve) => setTimeout(() => resolve(data), delay));
-}
-
-/**
- * Helper to build query string from params object
- */
-function _buildQueryParams(params: Record<string, string | number | boolean | string[] | undefined>): URLSearchParams {
-  const qs = new URLSearchParams();
-  for (const [key, value] of Object.entries(params)) {
-    if (value === undefined || value === null) continue;
-    if (Array.isArray(value)) {
-      value.forEach(v => qs.append(key, v));
-    } else {
-      qs.append(key, String(value));
-    }
-  }
-  return qs;
-}
-
-/**
  * Wrapper for API calls with consistent error handling
  */
 async function handleApiCall<T>(
@@ -454,6 +422,63 @@ async function handleApiCall<T>(
 }
 
 export const api = {
+  async getNetworks(): Promise<NetworkListResponse> {
+    if (USE_MOCKS) {
+      const now = new Date().toISOString();
+      return {
+        cached_at: now,
+        networks: [
+          {
+            id: "mainnet",
+            name: "Stellar Mainnet",
+            network_type: "mainnet",
+            status: "online",
+            endpoints: {
+              rpc_url: "https://rpc-mainnet.stellar.org",
+              health_url: "https://rpc-mainnet.stellar.org/health",
+              explorer_url: "https://stellar.expert/explorer/public",
+            },
+            last_checked_at: now,
+            consecutive_failures: 0,
+          },
+          {
+            id: "testnet",
+            name: "Stellar Testnet",
+            network_type: "testnet",
+            status: "online",
+            endpoints: {
+              rpc_url: "https://rpc-testnet.stellar.org",
+              health_url: "https://rpc-testnet.stellar.org/health",
+              explorer_url: "https://stellar.expert/explorer/testnet",
+              friendbot_url: "https://friendbot.stellar.org",
+            },
+            last_checked_at: now,
+            consecutive_failures: 0,
+          },
+          {
+            id: "futurenet",
+            name: "Stellar Futurenet",
+            network_type: "futurenet",
+            status: "online",
+            endpoints: {
+              rpc_url: "https://rpc-futurenet.stellar.org",
+              health_url: "https://rpc-futurenet.stellar.org/health",
+              explorer_url: "https://stellar.expert/explorer/futurenet",
+              friendbot_url: "https://friendbot-futurenet.stellar.org",
+            },
+            last_checked_at: now,
+            consecutive_failures: 0,
+          },
+        ],
+      };
+    }
+
+    return handleApiCall<NetworkListResponse>(
+      () => fetch(`${API_URL}/networks`),
+      "/networks",
+    );
+  },
+
   // Contract endpoints
   async getContracts(
     params?: ContractSearchParams,
@@ -560,12 +585,12 @@ export const api = {
     const queryParams = new URLSearchParams();
     if (params?.query) queryParams.append("query", params.query);
     if (params?.network) queryParams.append("network", params.network);
-    params?.networks?.forEach((network) => queryParams.append("network", network));
+    params?.networks?.forEach((network) => queryParams.append("networks", network));
     if (params?.verified_only !== undefined)
       queryParams.append("verified_only", String(params.verified_only));
     if (params?.category) queryParams.append("category", params.category);
     params?.categories?.forEach((category) =>
-      queryParams.append("category", category),
+      queryParams.append("categories", category),
     );
     if (params?.language) queryParams.append("language", params.language);
     params?.languages?.forEach((language) =>
@@ -592,12 +617,53 @@ export const api = {
       () => fetch(`${API_URL}/api/contracts?${queryParams}`),
       '/api/contracts'
     );
-    // Backend may return "contracts" instead of "items" — normalize for PaginatedResponse
+    // Normalize legacy field names from older backend responses
     const raw = data as unknown as Record<string, unknown>;
-    if (Array.isArray(raw.contracts) && data.items === undefined) {
-      return { ...data, items: raw.contracts as Contract[] };
+    const normalized = { ...data } as PaginatedResponse<Contract> & Record<string, unknown>;
+    if (Array.isArray(raw.contracts) && !Array.isArray(raw.items)) {
+      normalized.items = raw.contracts as Contract[];
     }
-    return data;
+    if (typeof raw.pages === 'number' && raw.total_pages === undefined) {
+      normalized.total_pages = raw.pages as number;
+    }
+    return normalized;
+  },
+
+  async getContractSearchSuggestions(
+    q: string,
+    limit = 8,
+  ): Promise<SearchSuggestionsResponse> {
+    if (USE_MOCKS) {
+      const lowered = q.trim().toLowerCase();
+      if (!lowered) {
+        return { items: [] };
+      }
+
+      const items = Array.from(
+        new Set(
+          MOCK_CONTRACTS
+            .flatMap((contract) => [contract.name, contract.category].filter(Boolean))
+            .filter((value: string) => value.toLowerCase().includes(lowered)),
+        ),
+      )
+        .slice(0, limit)
+        .map((text) => ({
+          text,
+          kind: MOCK_CONTRACTS.some((contract) => contract.name === text) ? 'contract' : 'category',
+          score: 1,
+        }));
+
+      return { items };
+    }
+
+    const params = new URLSearchParams();
+    params.set("q", q);
+    params.set("limit", String(limit));
+
+    return handleApiCall<SearchSuggestionsResponse>(
+      () => fetch(`${API_URL}/api/contracts/suggestions?${params.toString()}`),
+      "/api/contracts/suggestions",
+    );
   },
 
   async getContract(id: string, network?: Network): Promise<ContractGetResponse> {
@@ -686,22 +752,19 @@ export const api = {
     );
   },
 
-  async getContractPerformance(id: string): Promise<ContractPerformanceSummary> {
-    if (USE_MOCKS) {
-      return {
-        contract_id: id,
-        latest_benchmarks: [],
-        metric_snapshots: [],
-        trends: [],
-        regressions: [],
-        comparisons: [],
-        unresolved_alerts: [],
-      };
-    }
+  async getContractAbi(id: string, version?: string): Promise<ContractAbiResponse> {
+    const url = new URL(`${API_URL}/api/contracts/${id}/abi`);
+    if (version) url.searchParams.set("version", version);
+    return handleApiCall<ContractAbiResponse>(
+      () => fetch(url.toString()),
+      `/api/contracts/${id}/abi`
+    );
+  },
 
-    return handleApiCall<ContractPerformanceSummary>(
-      () => fetch(`${API_URL}/api/contracts/${id}/performance`),
-      `/api/contracts/${id}/performance`
+  async getContractChangelog(id: string): Promise<ContractChangelogResponse> {
+    return handleApiCall<ContractChangelogResponse>(
+      () => fetch(`${API_URL}/api/contracts/${id}/changelog`),
+      `/api/contracts/${id}/changelog`
     );
   },
 
@@ -1195,6 +1258,10 @@ export interface GraphEdge {
   source: string;
   target: string;
   dependency_type: string;
+  call_frequency?: number;
+  call_volume?: number;
+  is_estimated?: boolean;
+  is_circular?: boolean;
 }
 
 export interface GraphResponse {
