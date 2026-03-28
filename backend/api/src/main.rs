@@ -45,6 +45,7 @@ mod release_notes_routes;
 pub mod request_tracing;
 mod resource_handlers;
 mod resource_tracking;
+mod recommendation_handlers;
 mod routes;
 pub mod security_log;
 pub mod signing_handlers;
@@ -177,7 +178,7 @@ async fn main() -> Result<()> {
     let je = job_engine.clone();
     tokio::spawn(async move { je.run_worker(job_rx).await });
 
-    let state = AppState::new(pool.clone(), registry, job_engine, is_shutting_down.clone()).await;
+    let state = AppState::new(pool.clone(), registry, job_engine, is_shutting_down.clone()).await?;
 
     // Spawn the background DB and cache monitoring task
     db_monitoring::spawn_db_monitoring_task(pool.clone(), state.cache.clone());
