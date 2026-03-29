@@ -3,8 +3,9 @@ use crate::openapi;
 use crate::{
     ab_test_handlers, auth, auth_handlers, batch_verify_handlers, breaking_changes,
     canary_handlers, category_handlers, compatibility_testing_handlers, contract_events,
-    custom_metrics_handlers, deprecation_handlers, handlers, metrics_handler, migration_handlers,
-    performance_handlers, resource_handlers, similarity_handlers, state::AppState, websocket,
+    custom_metrics_handlers, deprecation_handlers, gas_estimation_handlers, handlers,
+    metrics_handler, migration_handlers, performance_handlers, resource_handlers,
+    similarity_handlers, state::AppState, websocket,
 };
 
 use axum::{
@@ -278,6 +279,16 @@ pub fn contract_routes() -> Router<AppState> {
         .route(
             "/api/contracts/simulate-deploy",
             post(simulation_handlers::simulate_deploy),
+        )
+        // Gas usage estimation (Issue #496)
+        // Static segment "gas-estimate/batch" registered before dynamic ":method"
+        .route(
+            "/api/contracts/:id/methods/gas-estimate/batch",
+            post(gas_estimation_handlers::batch_gas_estimate),
+        )
+        .route(
+            "/api/contracts/:id/methods/:method/gas-estimate",
+            get(gas_estimation_handlers::get_method_gas_estimate),
         )
         // Review system endpoints
         .route(

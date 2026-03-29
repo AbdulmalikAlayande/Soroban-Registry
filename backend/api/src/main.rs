@@ -62,6 +62,7 @@ mod release_notes_routes;
 pub mod request_tracing;
 mod resource_handlers;
 mod resource_tracking;
+mod gas_estimation_handlers;
 mod recommendation_handlers;
 mod routes;
 pub mod security_log;

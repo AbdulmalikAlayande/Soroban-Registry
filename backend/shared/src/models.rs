@@ -2791,6 +2791,88 @@ pub struct ContractFunctionInfo {
     pub is_view: bool,
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// GAS USAGE ESTIMATION TYPES (Issue #496)
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Confidence level of a gas estimate based on available historical data.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GasEstimateConfidence {
+    /// Derived from ≥10 real invocations.
+    High,
+    /// Derived from 1–9 real invocations.
+    Medium,
+    /// No historical data; purely heuristic.
+    Low,
+}
+
+/// Gas estimate for a single contract method.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MethodGasEstimate {
+    /// Name of the contract method.
+    pub method_name: String,
+    /// Lower bound of expected gas cost in stroops.
+    pub min_gas_stroops: i64,
+    /// Upper bound of expected gas cost in stroops.
+    pub max_gas_stroops: i64,
+    /// Average (or heuristic mid-point) gas cost in stroops.
+    pub avg_gas_stroops: i64,
+    /// Convenience field: average cost converted to XLM.
+    pub avg_gas_xlm: f64,
+    /// How confident the estimate is based on available samples.
+    pub confidence: GasEstimateConfidence,
+    /// Number of real invocations the estimate is based on (0 = heuristic only).
+    pub sample_count: i64,
+    /// Whether historical data was used for this estimate.
+    pub from_history: bool,
+    /// Unix timestamp (seconds) when the underlying data was last refreshed.
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
+/// Optional method-level parameters that make estimates more accurate.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct MethodParamHint {
+    /// Parameter name (as declared in the ABI).
+    pub name: String,
+    /// JSON-serialisable value used only for heuristic sizing.
+    pub value: serde_json::Value,
+}
+
+/// Query parameters for `GET /api/contracts/:id/methods/:method/gas-estimate`.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::IntoParams)]
+pub struct GasEstimateQuery {
+    /// Optional JSON-encoded array of `MethodParamHint` for a more realistic estimate.
+    #[serde(default)]
+    pub params: Option<String>,
+}
+
+/// Request body for batch gas estimation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchGasEstimateRequest {
+    /// List of method names to estimate.  Must be non-empty (max 50).
+    pub methods: Vec<BatchMethodEntry>,
+}
+
+/// One entry in a batch gas-estimate request.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchMethodEntry {
+    /// Name of the method to estimate.
+    pub method_name: String,
+    /// Optional parameter hints for this method.
+    #[serde(default)]
+    pub params: Vec<MethodParamHint>,
+}
+
+/// Response for batch gas estimation.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BatchGasEstimateResponse {
+    /// Estimates in the same order as the request.
+    pub estimates: Vec<MethodGasEstimate>,
+    /// Methods that were requested but could not be estimated (e.g., not in ABI).
+    pub not_found: Vec<String>,
+}
+
 fn default_true() -> bool {
     true
 }
