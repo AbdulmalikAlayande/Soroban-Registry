@@ -478,7 +478,7 @@ async fn handle_socket(
                 match event {
                     Ok(event) => {
                         if filter.matches(&event) {
-                            let msg = ServerMessage::Event { event };
+                            let msg = ServerMessage::Event { event: event.clone() };
                             if send_json(&mut sender, &msg).await.is_err() {
                                 break;
                             }

@@ -4,7 +4,7 @@ use axum::{
         rejection::{JsonRejection, QueryRejection},
         Path, Query, State,
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -12,19 +12,106 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde_json::{json, Value};
 use shared::{
-    pagination::Cursor, AdvancedSearchRequest, AnalyticsEventType, AuditActionType,
+    pagination::Cursor, source_storage::SourceFormat, AnalyticsEventType, AuditActionType,
     ChangePublisherRequest, Contract, ContractAnalyticsResponse, ContractAuditLog,
     ContractChangelogEntry, ContractChangelogResponse, ContractGetResponse,
-    ContractInteractionResponse, ContractSearchParams, ContractSource, ContractVersion,
+    ContractInteractionResponse, ContractSearchParams, ContractVersion, GraphResponse,
     CreateContractVersionRequest, CreateInteractionBatchRequest, CreateInteractionRequest,
-    DeploymentStats, FavoriteSearch, FieldOperator, InteractionTimeSeriesPoint,
+    DeploymentStats, InteractionTimeSeriesPoint,
     InteractionTimeSeriesResponse, InteractionsListResponse, InteractionsQueryParams,
     InteractorStats, Network, NetworkConfig, NetworkEndpoints, NetworkInfo, NetworkListResponse,
-    NetworkStatus, PaginatedResponse, PublishRequest, Publisher, QueryCondition, QueryNode,
-    QueryOperator, SaveFavoriteSearchRequest, SearchSuggestion, SearchSuggestionsResponse, SemVer,
-    TimelineEntry, TopUser, TrendingParams, UpdateContractMetadataRequest,
-    UpdateContractStatusRequest, VerifyRequest,
+    NetworkStatus, PaginatedResponse, PublishRequest, Publisher, SearchSuggestion, 
+    SearchSuggestionsResponse, SemVer, TimelineEntry, TopUser, TrendingParams, 
+    UpdateContractMetadataRequest, UpdateContractStatusRequest, VerifyRequest,
 };
+
+// ────────────────────────────────────────────────────────────────────────────
+// Missing Types (Issue #51, #32, etc.)
+// These types were used in handlers.rs but are now missing from the shared crate.
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct AdvancedSearchRequest {
+    pub query: QueryNode,
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+    pub sort_by: Option<shared::SortBy>,
+    pub sort_order: Option<shared::SortOrder>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryNode {
+    Condition(QueryCondition),
+    Group {
+        operator: QueryOperator,
+        conditions: Vec<QueryNode>,
+    },
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryOperator {
+    And,
+    Or,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct QueryCondition {
+    pub field: String,
+    pub operator: FieldOperator,
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldOperator {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    In,
+    Contains,
+    StartsWith,
+}
+
+#[derive(Debug, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct FavoriteSearch {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub query_json: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct SaveFavoriteSearchRequest {
+    pub name: String,
+    pub query: QueryNode,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+pub struct ContractSource {
+    pub id: uuid::Uuid,
+    pub contract_version_id: uuid::Uuid,
+    pub source_format: String,
+    pub storage_backend: String,
+    pub storage_key: String,
+    pub source_hash: String,
+    pub source_size: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+
+#[derive(Debug, serde::Serialize, sqlx::FromRow, utoipa::ToSchema)]
+pub struct ContractDeployment {
+    pub id: uuid::Uuid,
+    pub contract_id: uuid::Uuid,
+    pub contract_version_id: uuid::Uuid,
+    pub network: shared::Network,
+    pub address: String,
+    pub deployed_at: chrono::DateTime<chrono::Utc>,
+    pub transaction_hash: Option<String>,
+}
 use sqlx::QueryBuilder;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -60,6 +147,34 @@ use crate::{
 pub(crate) fn db_internal_error(operation: &str, err: sqlx::Error) -> ApiError {
     tracing::error!(operation = operation, error = ?err, "database operation failed");
     ApiError::internal("An unexpected database error occurred")
+}
+
+pub(crate) async fn fetch_contract_identity(
+    state: &AppState,
+    id: &str,
+) -> ApiResult<(Uuid, String)> {
+    if let Ok(uuid) = Uuid::parse_str(id) {
+        let (contract_id,): (String,) = sqlx::query_as("SELECT contract_id FROM contracts WHERE id = $1")
+            .bind(uuid)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| match err {
+                sqlx::Error::RowNotFound => ApiError::not_found("ContractNotFound", "Contract not found"),
+                _ => db_internal_error("fetch contract identity by uuid", err),
+            })?;
+        return Ok((uuid, contract_id));
+    }
+
+    let (uuid, contract_id): (Uuid, String) =
+        sqlx::query_as("SELECT id, contract_id FROM contracts WHERE contract_id = $1")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .map_err(|err| match err {
+                sqlx::Error::RowNotFound => ApiError::not_found("ContractNotFound", "Contract not found"),
+                _ => db_internal_error("fetch contract identity by address", err),
+            })?;
+    Ok((uuid, contract_id))
 }
 
 #[allow(dead_code)]
@@ -100,21 +215,19 @@ fn contract_timestamp_for_sort(
     }
 }
 
+
 async fn track_contract_access(state: &AppState, contract_id: Uuid) {
     let cache_key = contract_id.to_string();
     if !state.cache.should_refresh_contract_access(&cache_key).await {
         return;
     }
-
+    
     let db = state.db.clone();
     tokio::spawn(async move {
-        if let Err(err) = sqlx::query("UPDATE contracts SET last_accessed_at = NOW() WHERE id = $1")
+        let _ = sqlx::query("UPDATE contracts SET last_accessed_at = NOW() WHERE id = $1")
             .bind(contract_id)
             .execute(&db)
-            .await
-        {
-            tracing::warn!(contract_id = %contract_id, error = ?err, "failed to refresh contract last_accessed_at");
-        }
+            .await;
     });
 }
 
@@ -378,7 +491,7 @@ pub async fn run_network_catalog_refresh(state: AppState) {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, sqlx::Type)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, sqlx::Type, utoipa::ToSchema)]
 #[sqlx(type_name = "contract_audit_event_type", rename_all = "snake_case")]
 #[allow(dead_code)]
 pub enum ContractAuditEventType {
@@ -1137,7 +1250,7 @@ pub async fn get_contract_search_suggestions(
 )]
 pub async fn list_contracts(
     State(state): State<AppState>,
-    claims: Option<shared::AuthClaims>,
+    claims: Option<crate::auth::AuthClaims>,
     params: Result<Query<ContractSearchParams>, QueryRejection>,
 ) -> axum::response::Response {
     let search_started_at = std::time::Instant::now();
@@ -1190,16 +1303,15 @@ pub async fn list_contracts(
         "DESC"
     };
 
-    // Weights for ranking (configurable via parameters or default)
-    let w_text = params.w_text.unwrap_or(1.0);
-    let w_pop = params.w_pop.unwrap_or(0.5);
-    let w_rec = params.w_rec.unwrap_or(0.3);
-    let w_rat = params.w_rat.unwrap_or(0.4);
-    let w_pers = 0.5; // Weight for personalized boost
+    // Weights for ranking
+    let w_text = 1.0;
+    let w_pop = 0.5;
+    let w_rec = 0.3;
+    let w_rat = 0.4;
+    let w_pers = 0.5;
 
-    // Build dynamic query with advanced ranking
-    let mut query = String::from("WITH contract_stats AS (\n");
-    query.push_str(
+    let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("WITH contract_stats AS (\n");
+    query.push(
         "    SELECT 
                 c.id,
                 COUNT(DISTINCT ci.id) as interaction_count,
@@ -1208,17 +1320,9 @@ pub async fn list_contracts(
                 COUNT(DISTINCT r.id) as review_count",
     );
 
-    if let Some(ref uid) = params.user_id {
-        let cleaned_uid = uid.replace('\'', "''");
-        query.push_str(&format!(
-            ",\n                COUNT(DISTINCT CASE WHEN ci.user_address = '{}' THEN ci.id END) as user_interaction_count",
-            cleaned_uid
-        ));
-    } else {
-        query.push_str(",\n                0 as user_interaction_count");
-    }
+    query.push(",\n                0 as user_interaction_count");
 
-    query.push_str(
+    query.push(
         "\n            FROM contracts c
             LEFT JOIN contract_interactions ci ON c.id = ci.contract_id
             LEFT JOIN contract_versions cv ON c.id = cv.contract_id
@@ -1227,44 +1331,42 @@ pub async fn list_contracts(
         ),\n",
     );
 
-    query.push_str("ranked_contracts AS (\n");
-    query.push_str("    SELECT \n");
-    query.push_str("        c.*, \n");
+    query.push("ranked_contracts AS (\n");
+    query.push("    SELECT \n");
+    query.push("        c.*, \n");
 
     if let Some(ref q) = params.query {
-        // Clean query for tsquery
-        let cleaned_q = q.replace('\'', "''");
-        query.push_str(&format!(
-            "        ts_rank_cd(c.search_vector, plainto_tsquery('english', '{}')) as text_relevance,\n",
-            cleaned_q
-        ));
+        query.push("        ts_rank_cd(c.search_vector, plainto_tsquery('english', ");
+        query.push_bind(q);
+        query.push(")) as relevance_score,\n");
     } else {
-        query.push_str("        0.0 as text_relevance,\n");
+        query.push("        0.0 as relevance_score,\n");
     }
 
-    query.push_str(&format!(
+    query.push(
         "        LOG(1 + cs.interaction_count + 2 * cs.deployment_count) as popularity_score,
         1.0 / (1.0 + EXTRACT(DAYS FROM (NOW() - c.updated_at)) / 30.0) as recency_score,
         (cs.avg_rating / 5.0) * LOG(1.0 + cs.review_count) as rating_score,
         LOG(1 + cs.user_interaction_count) as personal_boost
     FROM contracts c
     JOIN contract_stats cs ON c.id = cs.id
-    WHERE (c.visibility = 'public'"
-    ));
+    WHERE (c.visibility = 'public'",
+    );
 
     let mut count_query =
-        String::from("SELECT COUNT(*) FROM contracts c WHERE (c.visibility = 'public'");
+        sqlx::QueryBuilder::<sqlx::Postgres>::new("SELECT COUNT(*) FROM contracts c WHERE (c.visibility = 'public'");
 
     if let Some(claims) = claims {
-        let visibility_clause = format!(
-            " OR (c.visibility = 'private' AND c.organization_id IN (SELECT organization_id FROM organization_members om JOIN publishers p ON om.publisher_id = p.id WHERE p.stellar_address = '{}'))",
-            claims.sub.replace('\'', "''")
-        );
-        query.push_str(&visibility_clause);
-        count_query.push_str(&visibility_clause);
+        query.push(" OR (c.visibility = 'private' AND c.organization_id IN (SELECT organization_id FROM organization_members om JOIN publishers p ON om.publisher_id = p.id WHERE p.stellar_address = ");
+        query.push_bind(&claims.sub);
+        query.push("))");
+        
+        count_query.push(" OR (c.visibility = 'private' AND c.organization_id IN (SELECT organization_id FROM organization_members om JOIN publishers p ON om.publisher_id = p.id WHERE p.stellar_address = ");
+        count_query.push_bind(&claims.sub);
+        count_query.push("))");
     }
-    query.push_str(")");
-    count_query.push_str(")");
+    query.push(")");
+    count_query.push(")");
 
     if params.verified_only.unwrap_or(false) {
         query.push(" AND c.is_verified = true");
@@ -1403,17 +1505,16 @@ pub async fn list_contracts(
             query.push(", c.id ");
             query.push(id_direction);
         }
-        shared::SortBy::Deployments => "c.deployment_count".to_string(),
-        shared::SortBy::Relevance => {
+        _ => {
             if let Some(ref q) = params.query {
                 let prefix = format!("{}%", q.to_ascii_lowercase());
                 query.push(" ORDER BY (CASE WHEN lower(c.name) = lower(");
                 query.push_bind(q);
                 query.push(") THEN 3.0 WHEN lower(c.name) LIKE ");
                 query.push_bind(&prefix);
-                query.push(" THEN 1.5 ELSE 0.0 END + ts_rank_cd(c.search_document, contracts_build_tsquery(");
+                query.push(" THEN 1.5 ELSE 0.0 END + ts_rank_cd(c.search_vector, plainto_tsquery('english', ");
                 query.push_bind(q);
-                query.push("), 32)) ");
+                query.push("))) ");
                 query.push(direction);
                 query.push(", c.id ");
                 query.push(id_direction);
@@ -1431,15 +1532,15 @@ pub async fn list_contracts(
     query.push(" OFFSET ");
     query.push_bind(offset);
 
-    let contracts: Vec<Contract> = match query.build_query_as().fetch_all(&state.db).await {
+    let contracts: Vec<Contract> = match query.build_query_as::<Contract>().fetch_all(&state.db).await {
         Ok(rows) => rows,
         Err(err) => {
-            tracing::error!(query = %query, error = ?err, "Search query failed");
+            tracing::error!(error = ?err, "Search query failed");
             return db_internal_error("list contracts with ranking", err).into_response();
         }
     };
 
-    let total: i64 = match count_query.build_query_scalar().fetch_one(&state.db).await {
+    let total: i64 = match count_query.build_query_scalar::<i64>().fetch_one(&state.db).await {
         Ok(v) => v,
         Err(err) => return db_internal_error("count filtered contracts", err).into_response(),
     };
@@ -1495,7 +1596,7 @@ pub async fn list_contracts(
 )]
 pub async fn get_contract(
     State(state): State<AppState>,
-    claims: Option<shared::AuthClaims>,
+    claims: Option<crate::auth::AuthClaims>,
     Path(id): Path<String>,
     Query(query): Query<GetContractQuery>,
 ) -> ApiResult<Json<ContractGetResponse>> {
@@ -1523,7 +1624,7 @@ pub async fn get_contract(
         let is_member = if let Some(ref claims) = claims {
             if let Some(org_id) = contract.organization_id {
                 crate::org_handlers::check_org_role(
-                    &state.pool,
+                    &state.db,
                     org_id,
                     &claims.sub,
                     shared::OrganizationRole::Viewer,
@@ -1538,7 +1639,7 @@ pub async fn get_contract(
         };
 
         if !is_member {
-            return Err(ApiError::forbidden(
+            return Err(ApiError::forbidden_with_error(
                 "AccessDenied",
                 "This contract is private and you do not have access to it",
             ));
@@ -1776,8 +1877,8 @@ pub async fn upload_contract_source(
         .map_err(|_| ApiError::bad_request("InvalidBase64", "source_base64 must be base64"))?;
 
     let source_format = match req.source_format.to_lowercase().as_str() {
-        "rust" => shared::models::SourceFormat::Rust,
-        "wasm" => shared::models::SourceFormat::Wasm,
+        "rust" => SourceFormat::Rust,
+        "wasm" => SourceFormat::Wasm,
         other => {
             return Err(ApiError::bad_request(
                 "InvalidSourceFormat",
@@ -1872,8 +1973,8 @@ pub async fn get_contract_source(
         .to_lowercase();
 
     let source_format = match format.as_str() {
-        "rust" => shared::models::SourceFormat::Rust,
-        "wasm" => shared::models::SourceFormat::Wasm,
+        "rust" => SourceFormat::Rust,
+        "wasm" => SourceFormat::Wasm,
         other => {
             return Err(ApiError::bad_request(
                 "InvalidSourceFormat",
@@ -1976,8 +2077,8 @@ pub async fn get_contract_source_diff(
         .map_err(|err| db_internal_error("fetch contract version", err))?;
 
         let sf = match source_format {
-            "rust" => shared::models::SourceFormat::Rust,
-            "wasm" => shared::models::SourceFormat::Wasm,
+            "rust" => SourceFormat::Rust,
+            "wasm" => SourceFormat::Wasm,
             _ => {
                 return Err(ApiError::bad_request(
                     "InvalidSourceFormat",
@@ -2419,38 +2520,6 @@ pub async fn create_contract_version(
     Ok(Json(version_row))
 }
 
-async fn fetch_contract_identity(state: &AppState, id: &str) -> ApiResult<(Uuid, String)> {
-    if let Ok(uuid) = Uuid::parse_str(id) {
-        let row = sqlx::query_as::<_, (Uuid, String)>(
-            "SELECT id, contract_id FROM contracts WHERE id = $1",
-        )
-        .bind(uuid)
-        .fetch_optional(&state.db)
-        .await
-        .map_err(|err| db_internal_error("fetch contract", err))?;
-        return row.ok_or_else(|| {
-            ApiError::not_found(
-                "ContractNotFound",
-                format!("No contract found with ID: {}", id),
-            )
-        });
-    }
-
-    let row = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, contract_id FROM contracts WHERE contract_id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|err| db_internal_error("fetch contract", err))?;
-
-    row.ok_or_else(|| {
-        ApiError::not_found(
-            "ContractNotFound",
-            format!("No contract found with ID: {}", id),
-        )
-    })
-}
 
 async fn ensure_contract_exists(
     state: &AppState,
@@ -3272,7 +3341,7 @@ pub async fn verify_contract(
     )
     .await;
     let onchain_verifier = OnChainVerifier::new();
-    let abi_json = resolve_abi(&state, &contract.contract_id).await.ok();
+    let abi_json = resolve_abi(&state, &contract.contract_id, false).await.ok();
     let onchain_result = onchain_verifier
         .verify_contract(&state.cache, &contract, abi_json.as_deref())
         .await;
@@ -4022,17 +4091,6 @@ pub async fn get_all_audit_logs(
 
 #[utoipa::path(
     get,
-    path = "/api/contracts/{id}/deployments/status",
-    params(
-        ("id" = String, Path, description = "Contract UUID")
-    ),
-    responses(
-        (status = 200, description = "Current deployment status", body = Object)
-    ),
-    tag = "Deployments"
-)]
-#[utoipa::path(
-    get,
     path = "/api/contracts/{id}/deployments",
     params(
         ("id" = String, Path, description = "Contract UUID")
@@ -4054,6 +4112,8 @@ pub async fn get_contract_deployments(
         )
     })?;
 
+    ensure_contract_exists(&state, contract_uuid, &id, "get contract for list deployments").await?;
+
     let deployments: Vec<ContractDeployment> = sqlx::query_as(
         "SELECT * FROM contract_deployments WHERE contract_id = $1 ORDER BY deployed_at DESC",
     )
@@ -4065,6 +4125,29 @@ pub async fn get_contract_deployments(
     Ok(Json(deployments))
 }
 
+/// Stub for dashboard analytics (Issue #415)
+pub async fn get_dashboard_analytics(
+    State(_state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    Ok(Json(serde_json::json!({ 
+        "category_distribution": [],
+        "network_usage": [],
+        "deployment_trends": [],
+        "recent_additions": []
+    })))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/contracts/{id}/deployments/status",
+    params(
+        ("id" = String, Path, description = "Contract UUID")
+    ),
+    responses(
+        (status = 200, description = "Current deployment status", body = Object)
+    ),
+    tag = "Deployments"
+)]
 pub async fn get_deployment_status() -> impl IntoResponse {
     planned_not_implemented_response()
 }

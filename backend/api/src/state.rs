@@ -47,6 +47,8 @@ pub struct AppState {
     pub auth_mgr: Arc<RwLock<AuthManager>>,
     pub resource_mgr: Arc<RwLock<ResourceManager>>,
     pub event_broadcaster: broadcast::Sender<RealtimeEvent>,
+    pub contract_events: Arc<ContractEventHub>,
+    pub source_storage: Arc<shared::source_storage::SourceStorage>,
 }
 
 impl AppState {
@@ -55,14 +57,14 @@ impl AppState {
         registry: Registry,
         job_engine: Arc<soroban_batch::engine::JobEngine>,
         is_shutting_down: Arc<AtomicBool>,
-    ) -> Result<Self, crate::shared::error::RegistryError> {
+    ) -> Result<Self, shared::error::RegistryError> {
         let config = CacheConfig::from_env();
         let auth_mgr = Arc::new(RwLock::new(
             AuthManager::from_env().expect("JWT config validated at startup"),
         ));
         let resource_mgr = Arc::new(RwLock::new(ResourceManager::new()));
         let (event_broadcaster, _) = broadcast::channel(100);
-        Self {
+        Ok(Self {
             db,
             started_at: Instant::now(),
             cache: Arc::new(CacheLayer::new(config).await),
@@ -73,6 +75,12 @@ impl AppState {
             auth_mgr,
             resource_mgr,
             event_broadcaster,
-        }
+            contract_events: Arc::new(ContractEventHub::from_env()),
+            source_storage: Arc::new(
+                shared::source_storage::SourceStorage::new()
+                    .await
+                    .expect("source storage init"),
+            ),
+        })
     }
 }

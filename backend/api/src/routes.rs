@@ -1,11 +1,11 @@
 #[cfg(feature = "openapi")]
 use crate::openapi;
 use crate::{
-    ab_test_handlers, auth, auth_handlers, batch_verify_handlers, breaking_changes,
-    canary_handlers, category_handlers, compatibility_testing_handlers, contract_events,
-    custom_metrics_handlers, deprecation_handlers, handlers, metrics_handler, migration_handlers,
-    performance_handlers, resource_handlers, similarity_handlers, simulation_handlers,
-    state::AppState, websocket,
+    ab_test_handlers, analytics_handlers, auth, auth_handlers, batch_verify_handlers,
+    breaking_changes, canary_handlers, category_handlers, compatibility_testing_handlers,
+    contract_events, custom_metrics_handlers, deprecation_handlers, handlers, metrics_handler,
+    migration_handlers, org_handlers, performance_handlers, resource_handlers,
+    similarity_handlers, simulation_handlers, state::AppState, websocket,
 };
 
 use axum::{
@@ -292,6 +292,12 @@ pub fn health_routes() -> Router<AppState> {
             "/api/analytics/summary",
             get(analytics_handlers::get_analytics_summary),
         )
+}
+
+pub fn category_routes() -> Router<AppState> {
+    Router::new()
+        .route("/api/categories", get(category_handlers::list_categories))
+        .route("/api/categories/:id", get(category_handlers::get_category))
 }
 
 pub fn network_routes() -> Router<AppState> {

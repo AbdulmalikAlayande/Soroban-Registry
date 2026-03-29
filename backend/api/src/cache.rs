@@ -63,6 +63,7 @@ pub struct CacheLayer {
     pub generic_cache: MokaCache<String, String>,
     pub contract_access_cache: MokaCache<String, bool>,
     config: CacheConfig,
+    pub redis_cm: Option<ConnectionManager>,
 }
 
 impl CacheLayer {
@@ -94,12 +95,35 @@ impl CacheLayer {
             .time_to_live(Duration::from_secs(60))
             .build();
 
+        let redis_cm = if config.redis_enabled {
+            if let Some(url) = &config.redis_url {
+                match redis::Client::open(url.as_str()) {
+                    Ok(client) => match client.get_connection_manager().await {
+                        Ok(cm) => Some(cm),
+                        Err(e) => {
+                            tracing::error!("Failed to get Redis connection manager: {}", e);
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::error!("Failed to open Redis client: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         Self {
             abi_cache,
             verification_cache,
             generic_cache,
             contract_access_cache,
             config,
+            redis_cm,
         }
     }
 

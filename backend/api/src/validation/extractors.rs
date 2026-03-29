@@ -37,6 +37,7 @@ pub struct ValidationErrorResponse {
     pub message: String,
     pub details: serde_json::Value,
     pub timestamp: String,
+    pub correlation_id: String,
 }
 
 impl ValidationErrorResponse {

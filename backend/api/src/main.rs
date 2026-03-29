@@ -12,6 +12,7 @@ mod canary_handlers;
 mod compatibility_testing_handlers;
 mod contract_events;
 mod db_monitoring;
+mod graphql;
 
 mod activity_feed_handlers;
 mod activity_feed_routes;
@@ -177,7 +178,10 @@ async fn main() -> Result<()> {
     let je = job_engine.clone();
     tokio::spawn(async move { je.run_worker(job_rx).await });
 
-    let state = AppState::new(pool.clone(), registry, job_engine, is_shutting_down.clone()).await;
+    let state = AppState::new(pool.clone(), registry, job_engine, is_shutting_down.clone()).await?;
+
+    // Initialize GraphQL schema
+    let schema = graphql::schema::build_schema(state.clone());
 
     // Spawn the background DB and cache monitoring task
     db_monitoring::spawn_db_monitoring_task(pool.clone(), state.cache.clone());
@@ -255,6 +259,8 @@ async fn main() -> Result<()> {
         .merge(routes::observability_routes())
         .merge(routes::websocket_routes())
         .merge(release_notes_routes::release_notes_routes())
+        .route("/api/graphql", axum::routing::post(graphql::graphql_handler).with_state(schema))
+        .route("/api/graphql/playground", axum::routing::get(graphql::graphql_playground))
         .nest("/api", activity_feed_routes::routes())
         .fallback(handlers::route_not_found)
         .layer(middleware::from_fn(

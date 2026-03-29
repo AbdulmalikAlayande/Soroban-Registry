@@ -1,11 +1,12 @@
-use crate::{error::ApiResult, handlers::db_internal_error, state::AppState};
+use crate::{auth::AuthClaims, error::ApiResult, handlers::db_internal_error, state::AppState};
+use chrono::Utc;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
     Json,
 };
 use shared::{
-    AuthClaims, CreateOrganizationRequest, InviteMemberRequest, Organization, OrganizationMember,
+    CreateOrganizationRequest, InviteMemberRequest, Organization, OrganizationMember,
     OrganizationRole, UpdateOrganizationRequest,
 };
 use uuid::Uuid;
@@ -17,7 +18,7 @@ pub async fn create_organization(
     Json(payload): Json<CreateOrganizationRequest>,
 ) -> ApiResult<(StatusCode, Json<Organization>)> {
     let mut tx = state
-        .pool
+        .db
         .begin()
         .await
         .map_err(|e| db_internal_error("begin_transaction", e))?;
@@ -38,32 +39,31 @@ pub async fn create_organization(
     })?;
 
     // 2. Create organization
-    let org = sqlx::query_as!(
-        Organization,
+    let org: Organization = sqlx::query_as(
         r#"
         INSERT INTO organizations (name, slug, description, is_private)
         VALUES ($1, $2, $3, $4)
         RETURNING *
         "#,
-        payload.name,
-        payload.slug,
-        payload.description,
-        payload.is_private.unwrap_or(true)
     )
+    .bind(&payload.name)
+    .bind(&payload.slug)
+    .bind(&payload.description)
+    .bind(payload.is_private.unwrap_or(true))
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| db_internal_error("create_organization", e))?;
 
     // 3. Add creator as Admin
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO organization_members (organization_id, publisher_id, role)
         VALUES ($1, $2, $3)
         "#,
-        org.id,
-        publisher_id,
-        OrganizationRole::Admin as OrganizationRole
     )
+    .bind(org.id)
+    .bind(publisher_id)
+    .bind(OrganizationRole::Admin)
     .execute(&mut *tx)
     .await
     .map_err(|e| db_internal_error("add_org_admin", e))?;
@@ -84,20 +84,18 @@ pub async fn get_organization(
     let org_id = Uuid::parse_str(&slug_or_id).ok();
 
     let org = if let Some(id) = org_id {
-        sqlx::query_as!(
-            Organization,
+        sqlx::query_as::<_, Organization>(
             "SELECT * FROM organizations WHERE id = $1",
-            id
         )
-        .fetch_optional(&state.pool)
+        .bind(id)
+        .fetch_optional(&state.db)
         .await
     } else {
-        sqlx::query_as!(
-            Organization,
+        sqlx::query_as::<_, Organization>(
             "SELECT * FROM organizations WHERE slug = $1",
-            slug_or_id
         )
-        .fetch_optional(&state.pool)
+        .bind(slug_or_id)
+        .fetch_optional(&state.db)
         .await
     }
     .map_err(|e| db_internal_error("get_organization", e))?
@@ -106,7 +104,7 @@ pub async fn get_organization(
     // Visibility check for private organizations
     if org.is_private {
         let is_member = if let Some(ref claims) = claims {
-            check_org_role(&state.pool, org.id, &claims.sub, OrganizationRole::Viewer)
+            check_org_role(&state.db, org.id, &claims.sub, OrganizationRole::Viewer)
                 .await
                 .is_ok()
         } else {
@@ -129,10 +127,9 @@ pub async fn update_organization(
     Json(payload): Json<UpdateOrganizationRequest>,
 ) -> ApiResult<Json<Organization>> {
     // Check if user is Admin of the org
-    check_org_role(&state.pool, id, &claims.sub, OrganizationRole::Admin).await?;
+    check_org_role(&state.db, id, &claims.sub, OrganizationRole::Admin).await?;
 
-    let org = sqlx::query_as!(
-        Organization,
+    let org: Organization = sqlx::query_as(
         r#"
         UPDATE organizations
         SET 
@@ -143,12 +140,12 @@ pub async fn update_organization(
         WHERE id = $4
         RETURNING *
         "#,
-        payload.name,
-        payload.description,
-        payload.is_private,
-        id
     )
-    .fetch_one(&state.pool)
+    .bind(payload.name)
+    .bind(payload.description)
+    .bind(payload.is_private)
+    .bind(id)
+    .fetch_one(&state.db)
     .await
     .map_err(|e| db_internal_error("update_organization", e))?;
 
@@ -162,22 +159,23 @@ pub async fn check_org_role(
     user_address: &str,
     min_role: OrganizationRole,
 ) -> ApiResult<OrganizationRole> {
-    let member = sqlx::query!(
+    let member_row: Option<(OrganizationRole,)> = sqlx::query_as(
         r#"
-        SELECT role as "role: OrganizationRole"
+        SELECT om.role
         FROM organization_members om
         JOIN publishers p ON om.publisher_id = p.id
         WHERE om.organization_id = $1 AND p.stellar_address = $2
         "#,
-        org_id,
-        user_address
     )
+    .bind(org_id)
+    .bind(user_address)
     .fetch_optional(pool)
     .await
-    .map_err(|e| db_internal_error("check_org_role", e))?
-    .ok_or(StatusCode::FORBIDDEN)?;
+    .map_err(|e| db_internal_error("check_org_role", e))?;
 
-    let has_access = match (min_role, member.role) {
+    let role = member_row.ok_or(StatusCode::FORBIDDEN)?.0;
+
+    let has_access = match (min_role, role) {
         (OrganizationRole::Admin, OrganizationRole::Admin) => true,
         (OrganizationRole::Member, OrganizationRole::Admin | OrganizationRole::Member) => true,
         (OrganizationRole::Viewer, _) => true,
@@ -185,7 +183,7 @@ pub async fn check_org_role(
     };
 
     if has_access {
-        Ok(member.role)
+        Ok(role)
     } else {
         Err(StatusCode::FORBIDDEN.into())
     }
@@ -198,18 +196,17 @@ pub async fn list_org_members(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<Vec<OrganizationMember>>> {
     // Check if user is a member of the org
-    check_org_role(&state.pool, id, &claims.sub, OrganizationRole::Viewer).await?;
+    check_org_role(&state.db, id, &claims.sub, OrganizationRole::Viewer).await?;
 
-    let members = sqlx::query_as!(
-        OrganizationMember,
+    let members = sqlx::query_as::<_, OrganizationMember>(
         r#"
-        SELECT organization_id, publisher_id, role as "role: OrganizationRole", joined_at
+        SELECT organization_id, publisher_id, role, joined_at
         FROM organization_members
         WHERE organization_id = $1
         "#,
-        id
     )
-    .fetch_all(&state.pool)
+    .bind(id)
+    .fetch_all(&state.db)
     .await
     .map_err(|e| db_internal_error("list_org_members", e))?;
 
@@ -224,33 +221,33 @@ pub async fn invite_member(
     Json(payload): Json<InviteMemberRequest>,
 ) -> ApiResult<StatusCode> {
     // Check if user is an Admin of the org
-    check_org_role(&state.pool, id, &claims.sub, OrganizationRole::Admin).await?;
+    check_org_role(&state.db, id, &claims.sub, OrganizationRole::Admin).await?;
 
     // Get inviter publisher ID
-    let inviter_id: Uuid = sqlx::query_scalar!(
+    let inviter_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM publishers WHERE stellar_address = $1",
-        claims.sub
     )
-    .fetch_one(&state.pool)
+    .bind(&claims.sub)
+    .fetch_one(&state.db)
     .await
     .map_err(|e| db_internal_error("get_inviter_id", e))?;
 
     let token = Uuid::new_v4().to_string();
     let expires_at = Utc::now() + chrono::Duration::days(7);
 
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO organization_invitations (organization_id, email, role, token, inviter_id, expires_at)
         VALUES ($1, $2, $3, $4, $5, $6)
         "#,
-        id,
-        payload.email,
-        payload.role as OrganizationRole,
-        token,
-        inviter_id,
-        expires_at
     )
-    .execute(&state.pool)
+    .bind(id)
+    .bind(&payload.email)
+    .bind(payload.role)
+    .bind(&token)
+    .bind(inviter_id)
+    .bind(expires_at)
+    .execute(&state.db)
     .await
     .map_err(|e| db_internal_error("create_invitation", e))?;
 
@@ -273,47 +270,47 @@ pub async fn accept_invitation(
         .map_err(|e| db_internal_error("begin_transaction", e))?;
 
     // 1. Validate invitation
-    let invite = sqlx::query!(
+    let invite = sqlx::query_as::<_, shared::OrganizationInvitation>(
         r#"
         SELECT * FROM organization_invitations
         WHERE token = $1 AND accepted_at IS NULL AND expires_at > NOW()
         "#,
-        token
     )
+    .bind(&token)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| db_internal_error("get_invitation", e))?
     .ok_or(StatusCode::NOT_FOUND)?;
 
     // 2. Get publisher ID for accepting user
-    let publisher_id: Uuid = sqlx::query_scalar!(
+    let publisher_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM publishers WHERE stellar_address = $1",
-        claims.sub
     )
+    .bind(&claims.sub)
     .fetch_one(&mut *tx)
     .await
     .map_err(|e| db_internal_error("get_publisher_id", e))?;
 
     // 3. Add member
-    sqlx::query!(
+    sqlx::query(
         r#"
         INSERT INTO organization_members (organization_id, publisher_id, role)
         VALUES ($1, $2, $3)
         ON CONFLICT (organization_id, publisher_id) DO UPDATE SET role = EXCLUDED.role
         "#,
-        invite.organization_id,
-        publisher_id,
-        invite.role
     )
+    .bind(invite.organization_id)
+    .bind(publisher_id)
+    .bind(invite.role)
     .execute(&mut *tx)
     .await
     .map_err(|e| db_internal_error("add_member", e))?;
 
     // 4. Mark invitation as accepted
-    sqlx::query!(
+    sqlx::query(
         "UPDATE organization_invitations SET accepted_at = NOW() WHERE id = $1",
-        invite.id
     )
+    .bind(invite.id)
     .execute(&mut *tx)
     .await
     .map_err(|e| db_internal_error("mark_invite_accepted", e))?;
