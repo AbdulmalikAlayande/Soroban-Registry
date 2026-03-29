@@ -1,6 +1,7 @@
 #![allow(unused_variables)]
 
 mod backup;
+mod batch_register;
 mod batch_verify;
 mod commands;
 mod config;
@@ -497,6 +498,25 @@ pub enum Commands {
     Network {
         #[command(subcommand)]
         action: NetworkCommands,
+    },
+
+    /// Register multiple contracts from a YAML or JSON manifest file
+    BatchRegister {
+        /// Path to the manifest file (.yaml, .yml, or .json)
+        #[arg(long)]
+        manifest: String,
+
+        /// Publisher Stellar address (overrides `publisher` field in the manifest)
+        #[arg(long)]
+        publisher: Option<String>,
+
+        /// Validate all entries and show what would be registered without submitting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output results as machine-readable JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1846,6 +1866,29 @@ async fn main() -> Result<()> {
                 network::status(json).await?;
             }
         },
+
+        // ── Bulk contract registration (issue #525) ──────────────────────────
+        Commands::BatchRegister {
+            manifest,
+            publisher,
+            dry_run,
+            json,
+        } => {
+            log::debug!(
+                "Command: batch-register | manifest={} dry_run={} publisher={:?}",
+                manifest,
+                dry_run,
+                publisher
+            );
+            batch_register::run_batch_register(
+                &cli.api_url,
+                &manifest,
+                publisher.as_deref(),
+                dry_run,
+                json,
+            )
+            .await?;
+        }
     }
 
     Ok(())
