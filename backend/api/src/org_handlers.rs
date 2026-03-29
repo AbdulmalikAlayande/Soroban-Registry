@@ -5,13 +5,19 @@ use axum::{
     http::StatusCode,
     Json,
 };
+use chrono::Utc;
 use shared::{
     CreateOrganizationRequest, InviteMemberRequest, Organization, OrganizationMember,
     OrganizationRole, UpdateOrganizationRequest,
 };
+use sqlx::PgPool;
 use uuid::Uuid;
 
-/// Create a new organization
+fn db_internal_error(operation: &str, err: sqlx::Error) -> ApiError {
+    tracing::error!(operation = operation, error = ?err, "database operation failed");
+    ApiError::internal("An unexpected database error occurred")
+}
+
 pub async fn create_organization(
     State(state): State<AppState>,
     claims: AuthClaims,
@@ -23,20 +29,12 @@ pub async fn create_organization(
         .await
         .map_err(|e| db_internal_error("begin_transaction", e))?;
 
-    // 1. Get publisher ID from Stellar address (claims.sub)
-    let publisher_id: Uuid = sqlx::query_scalar!(
-        "SELECT id FROM publishers WHERE stellar_address = $1",
-        claims.sub
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| {
-        if matches!(e, sqlx::Error::RowNotFound) {
-            StatusCode::UNAUTHORIZED.into()
-        } else {
-            db_internal_error("get_publisher_id", e)
-        }
-    })?;
+    let publisher_id: Uuid = sqlx::query_scalar("SELECT id FROM publishers WHERE stellar_address = $1")
+        .bind(&claims.sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| db_internal_error("get_publisher_id", e))?
+        .ok_or_else(|| ApiError::unauthorized("Publisher not found for authenticated user"))?;
 
     // 2. Create organization
     let org: Organization = sqlx::query_as(
@@ -75,7 +73,6 @@ pub async fn create_organization(
     Ok((StatusCode::CREATED, Json(org)))
 }
 
-/// Get organization by slug or ID
 pub async fn get_organization(
     State(state): State<AppState>,
     claims: Option<AuthClaims>,
@@ -99,9 +96,8 @@ pub async fn get_organization(
         .await
     }
     .map_err(|e| db_internal_error("get_organization", e))?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .ok_or_else(|| ApiError::not_found("OrganizationNotFound", "Organization not found"))?;
 
-    // Visibility check for private organizations
     if org.is_private {
         let is_member = if let Some(ref claims) = claims {
             check_org_role(&state.db, org.id, &claims.sub, OrganizationRole::Viewer)
@@ -112,14 +108,13 @@ pub async fn get_organization(
         };
 
         if !is_member {
-            return Err(StatusCode::FORBIDDEN.into());
+            return Err(ApiError::forbidden("Access denied to private organization"));
         }
     }
 
     Ok(Json(org))
 }
 
-/// Update organization metadata
 pub async fn update_organization(
     State(state): State<AppState>,
     claims: AuthClaims,
@@ -132,7 +127,7 @@ pub async fn update_organization(
     let org: Organization = sqlx::query_as(
         r#"
         UPDATE organizations
-        SET 
+        SET
             name = COALESCE($1, name),
             description = COALESCE($2, description),
             is_private = COALESCE($3, is_private),
@@ -152,9 +147,8 @@ pub async fn update_organization(
     Ok(Json(org))
 }
 
-/// Helper to check if a user has a specific role (or higher) in an organization
 pub async fn check_org_role(
-    pool: &sqlx::PgPool,
+    pool: &PgPool,
     org_id: Uuid,
     user_address: &str,
     min_role: OrganizationRole,
@@ -165,6 +159,7 @@ pub async fn check_org_role(
         FROM organization_members om
         JOIN publishers p ON om.publisher_id = p.id
         WHERE om.organization_id = $1 AND p.stellar_address = $2
+        LIMIT 1
         "#,
     )
     .bind(org_id)
@@ -185,11 +180,10 @@ pub async fn check_org_role(
     if has_access {
         Ok(role)
     } else {
-        Err(StatusCode::FORBIDDEN.into())
+        Err(ApiError::forbidden("Insufficient organization role"))
     }
 }
 
-/// List all members of an organization
 pub async fn list_org_members(
     State(state): State<AppState>,
     claims: AuthClaims,
@@ -213,7 +207,6 @@ pub async fn list_org_members(
     Ok(Json(members))
 }
 
-/// Invite a member to an organization
 pub async fn invite_member(
     State(state): State<AppState>,
     claims: AuthClaims,
@@ -251,20 +244,23 @@ pub async fn invite_member(
     .await
     .map_err(|e| db_internal_error("create_invitation", e))?;
 
-    // In a real app, we would send an email here with the token.
-    tracing::info!(email = %payload.email, token = %token, "Member invited to organization");
-
     Ok(StatusCode::ACCEPTED)
 }
 
-/// Accept an organization invitation
 pub async fn accept_invitation(
     State(state): State<AppState>,
     claims: AuthClaims,
     Path(token): Path<String>,
 ) -> ApiResult<StatusCode> {
+    #[derive(sqlx::FromRow)]
+    struct InviteRow {
+        id: Uuid,
+        organization_id: Uuid,
+        role: OrganizationRole,
+    }
+
     let mut tx = state
-        .pool
+        .db
         .begin()
         .await
         .map_err(|e| db_internal_error("begin_transaction", e))?;
@@ -272,7 +268,8 @@ pub async fn accept_invitation(
     // 1. Validate invitation
     let invite = sqlx::query_as::<_, shared::OrganizationInvitation>(
         r#"
-        SELECT * FROM organization_invitations
+        SELECT id, organization_id, role
+        FROM organization_invitations
         WHERE token = $1 AND accepted_at IS NULL AND expires_at > NOW()
         "#,
     )
@@ -280,7 +277,7 @@ pub async fn accept_invitation(
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| db_internal_error("get_invitation", e))?
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .ok_or_else(|| ApiError::not_found("InvitationNotFound", "Invitation is invalid or expired"))?;
 
     // 2. Get publisher ID for accepting user
     let publisher_id: Uuid = sqlx::query_scalar(

@@ -432,11 +432,15 @@ async fn handle_socket(
     claims: Option<AuthClaims>,
     auth_warning: Option<String>,
 ) {
-    let connection_id = state.contract_events.next_connection_id();
+    // Use u64 counter for connection ID
+    static CONNECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let connection_id = CONNECTION_COUNTER.fetch_add(1, Ordering::Relaxed);
     let (mut sender, mut receiver) = socket.split();
-    let mut events = state.contract_events.subscribe();
-    let heartbeat_ms = state.contract_events.heartbeat_interval_ms();
-    let reconnect_ms = state.contract_events.reconnect_after_ms();
+    let mut events = state.event_broadcaster.subscribe();
+    
+    // Fixed intervals for heartbeat and reconnect
+    let heartbeat_ms: u64 = 30_000; // 30 seconds
+    let reconnect_ms: u64 = 5_000;  // 5 seconds
 
     let connected = ServerMessage::Connected {
         connection_id,
@@ -485,12 +489,15 @@ async fn handle_socket(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        let msg = ServerMessage::ResyncRequired {
-                            dropped_events: skipped,
-                            reconnect_after_ms: reconnect_ms,
-                        };
-                        if send_json(&mut sender, &msg).await.is_err() {
-                            break;
+                        let msg = serde_json::json!({
+                            "type": "resync_required",
+                            "dropped_events": skipped,
+                            "reconnect_after_ms": reconnect_ms,
+                        });
+                        if let Ok(msg_str) = serde_json::to_string(&msg) {
+                            if sender.send(Message::Text(msg_str)).await.is_err() {
+                                break;
+                            }
                         }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
