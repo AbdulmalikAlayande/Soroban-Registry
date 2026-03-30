@@ -177,10 +177,16 @@ pub fn contract_routes() -> Router<AppState> {
             "/api/analytics/dashboard",
             get(analytics_handlers::get_analytics_summary),
         )
+
         .route(
             "/api/contracts/:id/dependencies",
             get(crate::dependency_handlers::get_contract_dependencies),
         )
+        .route(
+            "/api/contracts/:id/graph",
+            get(handlers::get_contract_local_graph),
+        )
+
         .route(
             "/api/contracts/:id/trust-score",
             get(handlers::get_trust_score),
@@ -217,6 +223,10 @@ pub fn contract_routes() -> Router<AppState> {
         .route(
             "/api/contracts/similarity/analyze",
             post(similarity_handlers::analyze_contract_similarity_batch),
+        )
+        .route(
+            "/api/contracts/status/bulk",
+            post(handlers::bulk_update_contract_status),
         )
         .route(
             "/api/contracts/:id/performance",
@@ -300,6 +310,15 @@ pub fn contract_routes() -> Router<AppState> {
         .route(
             "/api/contracts/:id/rating-stats",
             get(handlers::reviews::get_rating_stats),
+        )
+        // Contract clone endpoints (#487)
+        .route(
+            "/api/contracts/:id/clone",
+            post(clone_federation_handlers::clone_contract),
+        )
+        .route(
+            "/api/contracts/:id/clones",
+            get(clone_federation_handlers::get_contract_clones),
         )
         .merge(favorite_routes())
 }
@@ -574,6 +593,49 @@ pub fn admin_routes() -> Router<AppState> {
             post(handlers::revert_contract_version),
         )
         .route_layer(middleware::from_fn(auth::require_admin))
+}
+
+pub fn federation_routes() -> Router<AppState> {
+    Router::new()
+        // Federated registry management (#499)
+        .route(
+            "/api/federation/registries",
+            get(clone_federation_handlers::list_federated_registries)
+                .post(clone_federation_handlers::register_federated_registry),
+        )
+        .route(
+            "/api/federation/registries/:id",
+            get(clone_federation_handlers::get_federated_registry),
+        )
+        // Sync operations
+        .route(
+            "/api/federation/sync",
+            post(clone_federation_handlers::sync_from_federated_registry),
+        )
+        .route(
+            "/api/federation/sync/:job_id",
+            get(clone_federation_handlers::get_sync_job_status),
+        )
+        .route(
+            "/api/federation/sync-history",
+            get(clone_federation_handlers::get_federation_sync_history),
+        )
+        // Discovery
+        .route(
+            "/api/federation/discover",
+            get(clone_federation_handlers::discover_federated_registries),
+        )
+        // Configuration
+        .route(
+            "/api/federation/config",
+            get(clone_federation_handlers::get_federation_config),
+        )
+        // Contract federation attribution
+        .route(
+            "/api/contracts/:id/federation",
+            get(clone_federation_handlers::get_contract_federation_attribution)
+                .patch(clone_federation_handlers::update_contract_federation_settings),
+        )
 }
 
 pub fn websocket_routes() -> Router<AppState> {

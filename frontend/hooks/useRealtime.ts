@@ -7,7 +7,17 @@ export function useRealtime() {
   const context = useContext(RealtimeContext);
   
   if (!context) {
-    throw new Error('useRealtime must be used within a RealtimeProvider');
+    // During SSR prerendering there may be no RealtimeProvider in scope.
+    // Return a default no-op fallback — real call-sites are 'use client'
+    // components and useRealtime is generally not called during SSR.
+    return {
+      isConnected: false,
+      unreadCount: 0,
+      notifications: [],
+      subscribe: () => () => {},
+      clearNotifications: () => {},
+      markAsRead: () => {},
+    };
   }
   
   return context;
