@@ -1,6 +1,8 @@
 #![allow(unused_variables)]
 
+mod analyze;
 mod backup;
+mod batch_register;
 mod batch_verify;
 mod cicd;
 mod commands;
@@ -28,11 +30,15 @@ mod release_notes;
 mod sla;
 mod table_format;
 mod test_framework;
+mod track_deployment;
 mod webhook;
 mod wizard;
+mod shell;
+mod track_deployment;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use patch::Severity;
 
 /// Soroban Registry CLI — discover, publish, verify, and deploy Soroban contracts
@@ -233,6 +239,13 @@ pub enum Commands {
 
     /// Launch the interactive setup wizard
     Wizard {},
+
+    /// Launch the interactive shell
+    Shell {
+        /// Initial network
+        #[arg(long)]
+        network: Option<String>,
+    },
 
     /// Show command history
     History {
@@ -497,6 +510,43 @@ pub enum Commands {
     Network {
         #[command(subcommand)]
         action: NetworkCommands,
+    },
+
+    /// Register multiple contracts from a YAML or JSON manifest file
+    BatchRegister {
+        /// Path to the manifest file (.yaml, .yml, or .json)
+        #[arg(long)]
+        manifest: String,
+
+        /// Publisher Stellar address (overrides `publisher` field in the manifest)
+        #[arg(long)]
+        publisher: Option<String>,
+
+        /// Validate all entries and show what would be registered without submitting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output results as machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Run advanced analysis on a deployed contract (#530)
+    Analyze {
+        /// On-chain contract ID to analyse
+        contract_id: String,
+
+        /// Stellar network (mainnet | testnet | futurenet)
+        #[arg(long, default_value = "testnet")]
+        network: String,
+
+        /// Report format: text (default), json, yaml
+        #[arg(long, default_value = "text")]
+        report_format: String,
+
+        /// Write the report to a file instead of stdout
+        #[arg(long, short = 'o')]
+        output: Option<String>,
     },
 }
 
@@ -1038,16 +1088,38 @@ async fn main() -> Result<()> {
     log::debug!("Verbose mode enabled");
     log::debug!("API URL: {}", cli.api_url);
 
-    // ── Resolve network ───────────────────────────────────────────────────────
-    let cfg_network = config::resolve_network(cli.network.clone())?;
-    let mut net_str = cfg_network.to_string();
-    if net_str == "auto" {
-        net_str = "mainnet".to_string();
+    handle_command(cli).await
+}
+
+pub async fn handle_command(cli: Cli) -> Result<()> {
+    match cli.command {
+        Commands::Shell { network: shell_network } => {
+            shell::run(&cli.api_url, shell_network).await
+        }
+        _ => {
+             // ── Resolve network ───────────────────────────────────────────────────────
+            let cfg_network = config::resolve_network(cli.network.clone())?;
+            let mut net_str = cfg_network.to_string();
+            if net_str == "auto" {
+                net_str = "mainnet".to_string();
+            }
+            let network: commands::Network = net_str.parse().unwrap();
+            
+            dispatch_command(cli, network, cfg_network).await
+        }
     }
-    let network: commands::Network = net_str.parse().unwrap();
+}
+
+pub async fn dispatch_command(cli: Cli, network: commands::Network, cfg_network: crate::config::Network) -> Result<()> {
     log::debug!("Network: {:?}", network);
 
     match cli.command {
+        Commands::Shell { .. } => {
+            // Already handled at top level, but for completeness or nested calls:
+            // We could call shell::run here again but to break recursion we don't.
+            println!("{}", "Warning: Shell already running".yellow());
+            return Ok(());
+        }
         Commands::Search {
             query,
             verified_only,
@@ -1863,6 +1935,52 @@ async fn main() -> Result<()> {
                 network::status(json).await?;
             }
         },
+
+        // ── Advanced contract analysis (issue #530) ─────────────────────────
+        Commands::Analyze {
+            contract_id,
+            network: net_str,
+            report_format,
+            output,
+        } => {
+            log::debug!(
+                "Command: analyze | contract_id={} network={} format={}",
+                contract_id,
+                net_str,
+                report_format
+            );
+            analyze::run(
+                &cli.api_url,
+                &contract_id,
+                &net_str,
+                &report_format,
+                output.as_deref(),
+            )
+            .await?;
+        }
+
+        // ── Bulk contract registration (issue #525) ──────────────────────────
+        Commands::BatchRegister {
+            manifest,
+            publisher,
+            dry_run,
+            json,
+        } => {
+            log::debug!(
+                "Command: batch-register | manifest={} dry_run={} publisher={:?}",
+                manifest,
+                dry_run,
+                publisher
+            );
+            batch_register::run_batch_register(
+                &cli.api_url,
+                &manifest,
+                publisher.as_deref(),
+                dry_run,
+                json,
+            )
+            .await?;
+        }
     }
 
     Ok(())
