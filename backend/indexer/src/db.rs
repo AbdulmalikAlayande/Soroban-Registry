@@ -387,7 +387,7 @@ impl DatabaseWriter {
             r#"
             SELECT
                 id, contract_id, wasm_hash, name, description,
-                publisher_id, network, is_verified, category, tags,
+                publisher_id, network, is_verified, verification_status, verified_by, verification_notes, verified_at, category, tags,
                 created_at, updated_at
             FROM contracts
             WHERE network = $1::network_type AND is_verified = false

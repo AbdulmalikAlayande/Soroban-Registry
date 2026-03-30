@@ -219,6 +219,10 @@ pub fn contract_routes() -> Router<AppState> {
             post(similarity_handlers::analyze_contract_similarity_batch),
         )
         .route(
+            "/api/contracts/status/bulk",
+            post(handlers::bulk_update_contract_status),
+        )
+        .route(
             "/api/contracts/:id/performance",
             get(performance_handlers::get_contract_performance_overview),
         )

@@ -33,11 +33,17 @@ pub struct Contract {
     pub publisher_id: Uuid,
     pub network: Network,
     pub is_verified: bool,
+    /// Overall verification status for the contract (unverified, pending, verified, failed)
+    pub verification_status: VerificationStatus,
     pub category: Option<String>,
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub verified_at: Option<DateTime<Utc>>,
+    /// Who verified the contract (publisher/user id)
+    pub verified_by: Option<Uuid>,
+    /// Optional notes attached to the verification
+    pub verification_notes: Option<String>,
     pub last_accessed_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub health_score: i32,
@@ -286,6 +292,8 @@ pub struct Verification {
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type, utoipa::ToSchema)]
 #[sqlx(type_name = "verification_status", rename_all = "lowercase")]
 pub enum VerificationStatus {
+    #[serde(rename = "unverified")]
+    Unverified,
     Pending,
     Verified,
     Failed,
@@ -440,6 +448,21 @@ pub struct UpdateContractStatusRequest {
     pub status: String,
     pub error_message: Option<String>,
     pub user_id: Option<Uuid>,
+}
+
+/// Item for bulk contract status updates
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BulkStatusUpdateItem {
+    pub id: Uuid,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub user_id: Option<Uuid>,
+}
+
+/// Bulk status update request body
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct BulkStatusUpdateRequest {
+    pub items: Vec<BulkStatusUpdateItem>,
 }
 
 /// Request to create a new contract version with ABI
@@ -651,6 +674,8 @@ pub struct ContractSearchParams {
     /// Multiple networks filter (e.g. ?networks=mainnet&networks=testnet)
     pub networks: Option<Vec<Network>>,
     pub verified_only: Option<bool>,
+    /// Filter by verification_status (unverified, pending, verified, failed)
+    pub verification_status: Option<VerificationStatus>,
     pub category: Option<String>,
     /// Multiple categories filter (e.g. ?categories=DeFi&categories=NFT)
     pub categories: Option<Vec<String>>,

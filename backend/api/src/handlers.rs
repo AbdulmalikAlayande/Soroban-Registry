@@ -1209,6 +1209,11 @@ pub async fn list_contracts(
         qb.push(" AND c.is_verified = true");
     }
 
+    if let Some(status) = &params.verification_status {
+        qb.push(" AND c.verification_status = ");
+        qb.push_bind(status);
+    }
+
     if let Some(category) = &params.category {
         qb.push(" AND c.category = ");
         qb.push_bind(category);
@@ -1274,6 +1279,10 @@ pub async fn list_contracts(
     }
     if params.verified_only.unwrap_or(false) {
         count_qb.push(" AND c.is_verified = true");
+    }
+    if let Some(status) = &params.verification_status {
+        count_qb.push(" AND c.verification_status = ");
+        count_qb.push_bind(status);
     }
     if let Some(category) = &params.category {
         count_qb.push(" AND c.category = ");
@@ -4624,10 +4633,13 @@ pub async fn update_contract_status(
         contract.verified_at
     };
 
-    sqlx::query("UPDATE contracts SET is_verified = $2, verified_at = COALESCE($3, verified_at), updated_at = NOW() WHERE id = $1")
+    sqlx::query("UPDATE contracts SET is_verified = $2, verified_at = COALESCE($3, verified_at), verification_status = $4::verification_status, verified_by = $5, verification_notes = $6, updated_at = NOW() WHERE id = $1")
         .bind(contract_uuid)
         .bind(is_verified_after)
         .bind(verified_at)
+        .bind(&normalized_status)
+        .bind(req.user_id)
+        .bind(req.error_message.as_deref())
         .execute(&state.db)
         .await
         .map_err(|err| db_internal_error("update contract verification flag from status", err))?;
@@ -4637,7 +4649,9 @@ pub async fn update_contract_status(
         let changes = json!({
             "status": { "before": before_status, "after": normalized_status },
             "is_verified": { "before": contract.is_verified, "after": is_verified_after },
-            "verification_id": { "before": Value::Null, "after": verification_id }
+            "verification_id": { "before": Value::Null, "after": verification_id },
+            "verified_by": { "before": contract.publisher_id, "after": req.user_id },
+            "verification_notes": { "before": contract.verified_at.map(|d| d.to_string()), "after": req.error_message }
         });
         write_contract_audit_log(
             &state.db,
@@ -4714,6 +4728,88 @@ pub async fn update_contract_status(
         "status": normalized_status,
         "is_verified": is_verified_after
     })))
+}
+
+pub async fn bulk_update_contract_status(
+    State(state): State<AppState>,
+    ValidatedJson(req): ValidatedJson<shared::BulkStatusUpdateRequest>,
+) -> ApiResult<Json<Value>> {
+    let mut results = Vec::new();
+
+    let mut tx = state.db.begin().await.map_err(|e| db_internal_error("begin tx for bulk status update", e))?;
+
+    for item in req.items.into_iter() {
+        let id = item.id;
+        let normalized_status = item.status.to_ascii_lowercase();
+        if normalized_status != "pending" && normalized_status != "verified" && normalized_status != "failed" {
+            results.push(json!({ "id": id, "ok": false, "error": "invalid_status" }));
+            continue;
+        }
+
+        let contract: Result<Contract, _> = sqlx::query_as("SELECT * FROM contracts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await;
+
+        let contract = match contract {
+            Ok(c) => c,
+            Err(_) => {
+                results.push(json!({ "id": id, "ok": false, "error": "not_found" }));
+                continue;
+            }
+        };
+
+        let verified_at: Option<chrono::DateTime<chrono::Utc>> = if normalized_status == "verified" { Some(chrono::Utc::now()) } else { None };
+        let is_verified_after = normalized_status == "verified";
+
+        let verification_id: Result<Uuid, sqlx::Error> = sqlx::query_scalar(
+            "INSERT INTO verifications (contract_id, status, source_code, build_params, compiler_version, verified_at, error_message) VALUES ($1, $2::verification_status, NULL, NULL, NULL, $3, $4) RETURNING id",
+        )
+        .bind(id)
+        .bind(&normalized_status)
+        .bind(verified_at)
+        .bind(item.error_message.as_deref())
+        .fetch_one(&mut *tx)
+        .await;
+
+        if let Err(e) = verification_id {
+            results.push(json!({ "id": id, "ok": false, "error": format!("db_insert_verification: {}", e) }));
+            continue;
+        }
+
+        let verification_id = verification_id.unwrap();
+
+        if let Err(e) = sqlx::query("UPDATE contracts SET is_verified = $2, verified_at = COALESCE($3, verified_at), verification_status = $4::verification_status, verified_by = $5, verification_notes = $6, updated_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(is_verified_after)
+            .bind(verified_at)
+            .bind(&normalized_status)
+            .bind(item.user_id)
+            .bind(item.error_message.as_deref())
+            .execute(&mut *tx)
+            .await
+        {
+            results.push(json!({ "id": id, "ok": false, "error": format!("db_update_contract: {}", e) }));
+            continue;
+        }
+
+        // audit log
+        let before_status = "pending".to_string();
+        let changes = json!({
+            "status": { "before": before_status, "after": normalized_status },
+            "is_verified": { "before": contract.is_verified, "after": is_verified_after },
+            "verification_id": { "before": Value::Null, "after": verification_id }
+        });
+
+        let _ = write_contract_audit_log(&state.db, AuditActionType::VerificationChanged, id, item.user_id.unwrap_or(contract.publisher_id), changes, "bulk")
+            .await;
+
+        results.push(json!({ "id": id, "ok": true, "verification_id": verification_id }));
+    }
+
+    tx.commit().await.map_err(|e| db_internal_error("commit bulk status update", e))?;
+
+    Ok(Json(json!({ "results": results })))
 }
 
 #[utoipa::path(
