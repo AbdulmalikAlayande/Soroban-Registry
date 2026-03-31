@@ -1279,6 +1279,35 @@ pub async fn get_contract_search_suggestions(
     ),
     tag = "Contracts"
 )]
+pub async fn list_tags(
+    State(state): State<AppState>,
+) -> ApiResult<Json<Value>> {
+    let rows = sqlx::query!(
+        "SELECT t.id, t.name, t.color, COUNT(ct.contract_id)::INT as usage_count \
+         FROM tags t \
+         LEFT JOIN contract_tags ct ON t.id = ct.tag_id \
+         GROUP BY t.id \
+         ORDER BY usage_count DESC, t.name ASC"
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("list tags", err))?;
+
+    let tags: Vec<Value> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "name": r.name,
+                "color": r.color,
+                "usage_count": r.usage_count
+            })
+        })
+        .collect();
+
+    Ok(Json(json!(tags)))
+}
+
 pub async fn list_contracts(
     State(state): State<AppState>,
     claims: Option<crate::auth::AuthClaims>,
@@ -1345,6 +1374,17 @@ pub async fn list_contracts(
         separated.push_unseparated(")");
     }
 
+    if let Some(tags) = &params.tags {
+        if !tags.is_empty() {
+            qb.push(" AND c.id IN (SELECT contract_id FROM contract_tags ct JOIN tags t ON t.id = ct.tag_id WHERE t.name IN (");
+            let mut separated = qb.separated(", ");
+            for tag in tags {
+                separated.push_bind(tag);
+            }
+            separated.push_unseparated("))");
+        }
+    }
+
     if let Some(q) = &params.query {
         let like = format!("%{}%", q.to_ascii_lowercase());
         qb.push(" AND (lower(c.name) LIKE ");
@@ -1371,10 +1411,45 @@ pub async fn list_contracts(
     qb.push(" OFFSET ");
     qb.push_bind(offset);
 
-    let contracts: Vec<Contract> = match qb.build_query_as().fetch_all(&state.db).await {
+    let mut contracts: Vec<Contract> = match qb.build_query_as().fetch_all(&state.db).await {
         Ok(rows) => rows,
         Err(err) => return db_internal_error("list contracts", err).into_response(),
     };
+
+    // Fetch tags for these contracts
+    let contract_ids: Vec<Uuid> = contracts.iter().map(|c| c.id).collect();
+    if !contract_ids.is_empty() {
+        let tag_rows = match sqlx::query!(
+            r#"
+            SELECT ct.contract_id, t.id, t.name, t.color
+            FROM tags t
+            JOIN contract_tags ct ON t.id = ct.tag_id
+            WHERE ct.contract_id = ANY($1)
+            "#,
+            &contract_ids
+        )
+        .fetch_all(&state.db)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => return db_internal_error("fetch tags", err).into_response(),
+        };
+
+        let mut tags_map: HashMap<Uuid, Vec<shared::Tag>> = HashMap::new();
+        for row in tag_rows {
+            tags_map.entry(row.contract_id).or_default().push(shared::Tag {
+                id: row.id,
+                name: row.name,
+                color: row.color,
+            });
+        }
+
+        for contract in &mut contracts {
+            if let Some(tags) = tags_map.remove(&contract.id) {
+                contract.tags = tags;
+            }
+        }
+    }
 
     let mut count_qb: QueryBuilder<'_, sqlx::Postgres> =
         QueryBuilder::new("SELECT COUNT(*) FROM contracts c WHERE c.visibility = 'public'");
@@ -1396,6 +1471,16 @@ pub async fn list_contracts(
     if let Some(category) = &params.category {
         count_qb.push(" AND c.category = ");
         count_qb.push_bind(category);
+    }
+    if let Some(tags) = &params.tags {
+        if !tags.is_empty() {
+            count_qb.push(" AND c.id IN (SELECT contract_id FROM contract_tags ct JOIN tags t ON t.id = ct.tag_id WHERE t.name IN (");
+            let mut separated = count_qb.separated(", ");
+            for tag in tags {
+                separated.push_bind(tag);
+            }
+            separated.push_unseparated("))");
+        }
     }
     if let Some(q) = &params.query {
         let like = format!("%{}%", q.to_ascii_lowercase());
@@ -1504,7 +1589,7 @@ fn render_contract_export(
             csv.push_str("id,logical_id,contract_id,wasm_hash,name,description,publisher_id,publisher_stellar_address,publisher_username,network,is_verified,category,tags,maturity,health_score,is_maintenance,deployment_count,audit_status,visibility,organization_id,network_configs,created_at,updated_at,verified_at,last_verified_at,last_accessed_at\n");
 
             for contract in contracts {
-                let tags = contract.tags.join("|");
+                let tags = contract.tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join("|");
                 let row = [
                     contract.id.to_string(),
                     optional_uuid_string(&contract.logical_id),
@@ -1615,7 +1700,7 @@ fn apply_contract_export_filters<'a>(
     }
 
     if let Some(tags) = filters.tags.as_ref().filter(|tags| !tags.is_empty()) {
-        query.push(" AND EXISTS (SELECT 1 FROM unnest(c.tags) AS tag WHERE tag IN (");
+        query.push(" AND c.id IN (SELECT contract_id FROM contract_tags ct JOIN tags t ON t.id = ct.tag_id WHERE t.name IN (");
         let mut separated = query.separated(", ");
         for tag in tags {
             separated.push_bind(tag);
@@ -1720,7 +1805,7 @@ async fn fetch_contract_export_rows(
     let mut query = QueryBuilder::<Postgres>::new(
         "SELECT c.id, c.logical_id, c.contract_id, c.wasm_hash, c.name, c.description, c.publisher_id, \
          p.stellar_address AS publisher_stellar_address, p.username AS publisher_username, \
-         c.network::text AS network, c.is_verified, c.category, c.tags, c.maturity::text AS maturity, \
+         c.network::text AS network, c.is_verified, c.category, c.maturity::text AS maturity, \
          c.health_score, c.is_maintenance, c.deployment_count, c.audit_status::text AS audit_status, \
          c.visibility::text AS visibility, c.organization_id, c.network_configs, c.created_at, \
          c.updated_at, c.verified_at, c.last_verified_at, c.last_accessed_at",
@@ -1773,7 +1858,38 @@ async fn fetch_contract_export_rows(
         .build_query_as::<ContractMetadataExportRecord>()
         .fetch_all(&state.db)
         .await
-        .map_err(|err| db_internal_error("fetch contracts for export", err))
+        .map_err(|err| db_internal_error("fetch contracts for export", err))?;
+
+    // Fetch tags for these records
+    let record_ids: Vec<Uuid> = records.iter().map(|r| r.id).collect();
+    if !record_ids.is_empty() {
+        let tag_rows = match sqlx::query!(
+            "SELECT ct.contract_id, t.id, t.name, t.color FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = ANY($1)",
+            &record_ids
+        )
+        .fetch_all(&state.db)
+        .await {
+            Ok(rows) => rows,
+            Err(err) => return Err(db_internal_error("fetch tags for export", err)),
+        };
+
+        let mut tags_map: HashMap<Uuid, Vec<shared::Tag>> = HashMap::new();
+        for row in tag_rows {
+            tags_map.entry(row.contract_id).or_default().push(shared::Tag {
+                id: row.id,
+                name: row.name,
+                color: row.color,
+            });
+        }
+
+        for record in &mut records {
+            if let Some(tags) = tags_map.remove(&record.id) {
+                record.tags = tags;
+            }
+        }
+    }
+
+    Ok(records)
 }
 
 async fn generate_contract_export_payload(
@@ -2025,6 +2141,23 @@ pub async fn get_contract(
                 _ => db_internal_error("get contract by slug", err),
             })?
     };
+
+    // Fetch tags
+    let tag_rows = match sqlx::query!(
+        "SELECT t.id, t.name, t.color FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = $1",
+        contract.id
+    )
+    .fetch_all(&state.db)
+    .await {
+        Ok(rows) => rows,
+        Err(err) => return Err(db_internal_error("fetch tags", err)),
+    };
+
+    contract.tags = tag_rows.into_iter().map(|r| shared::Tag {
+        id: r.id,
+        name: r.name,
+        color: r.color,
+    }).collect();
 
     // Visibility check
     if contract.visibility == shared::VisibilityType::Private {
@@ -3393,13 +3526,15 @@ pub async fn publish_contract(
     headers: HeaderMap,
     ValidatedJson(req): ValidatedJson<PublishRequest>,
 ) -> ApiResult<Json<Contract>> {
+    let mut tx = state.db.begin().await.map_err(|err| db_internal_error("begin publish tx", err))?;
+
     let publisher: Publisher = sqlx::query_as(
         "INSERT INTO publishers (stellar_address) VALUES ($1)
          ON CONFLICT (stellar_address) DO UPDATE SET stellar_address = EXCLUDED.stellar_address
          RETURNING *",
     )
     .bind(&req.publisher_address)
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|err| db_internal_error("upsert publisher", err))?;
 
@@ -4505,12 +4640,23 @@ pub async fn update_contract_metadata(
             _ => db_internal_error("fetch contract for metadata update", err),
         })?;
 
-    let after: Contract = sqlx::query_as(
+    // Fetch before tags for audit log
+    let before_tag_rows = sqlx::query!(
+        "SELECT t.name FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = $1",
+        before.id
+    )
+    .fetch_all(&state.db)
+    .await
+    .map_err(|err| db_internal_error("fetch before tags", err))?;
+    let before_tag_names: Vec<String> = before_tag_rows.into_iter().map(|r| r.name).collect();
+
+    let mut tx = state.db.begin().await.map_err(|err| db_internal_error("begin update metadata tx", err))?;
+
+    let mut after: Contract = sqlx::query_as(
         "UPDATE contracts
             SET name = COALESCE($2, name),
                 description = COALESCE($3, description),
                 category = COALESCE($4, category),
-                tags = COALESCE($5, tags),
                 updated_at = NOW()
           WHERE id = $1
           RETURNING *",
@@ -4519,10 +4665,63 @@ pub async fn update_contract_metadata(
     .bind(req.name.as_deref())
     .bind(req.description.as_deref())
     .bind(req.category.as_deref())
-    .bind(req.tags.as_ref())
-    .fetch_one(&state.db)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|err| db_internal_error("update contract metadata", err))?;
+
+    let mut after_tag_names = before_tag_names.clone();
+    if let Some(tag_names) = &req.tags {
+        after_tag_names = tag_names.clone();
+        sqlx::query("DELETE FROM contract_tags WHERE contract_id = $1")
+            .bind(contract_uuid)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| db_internal_error("delete old contract tags", err))?;
+
+        let mut new_tags = Vec::new();
+        for name in tag_names {
+            let tag: shared::Tag = sqlx::query_as(
+                "INSERT INTO tags (name) VALUES ($1)
+                 ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                 RETURNING id, name, color"
+            )
+            .bind(name)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|err| db_internal_error("upsert tag", err))?;
+
+            sqlx::query(
+                "INSERT INTO contract_tags (contract_id, tag_id) VALUES ($1, $2) ON CONFLICT DO NOTHING"
+            )
+            .bind(contract_uuid)
+            .bind(tag.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| db_internal_error("link contract tag", err))?;
+
+            new_tags.push(tag);
+        }
+        after.tags = new_tags;
+    } else {
+        // Fetch existing tags for after response
+        let after_tag_rows = sqlx::query!(
+            "SELECT t.id, t.name, t.color FROM tags t JOIN contract_tags ct ON t.id = ct.tag_id WHERE ct.contract_id = $1",
+            after.id
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|err| db_internal_error("fetch after tags", err))?;
+        after.tags = after_tag_rows
+            .into_iter()
+            .map(|r| shared::Tag {
+                id: r.id,
+                name: r.name,
+                color: r.color,
+            })
+            .collect();
+    }
+
+    tx.commit().await.map_err(|err| db_internal_error("commit update metadata tx", err))?;
 
     let mut changes = serde_json::Map::new();
     if before.name != after.name {

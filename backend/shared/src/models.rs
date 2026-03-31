@@ -8,6 +8,14 @@ use uuid::Uuid;
 // EXISTING REGISTRY TYPES
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Represents a tag that can be attached to a contract
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema, PartialEq)]
+pub struct Tag {
+    pub id: Uuid,
+    pub name: String,
+    pub color: String,
+}
+
 /// Represents a smart contract in the registry
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, utoipa::ToSchema)]
 #[schema(example = json!({
@@ -20,7 +28,10 @@ use uuid::Uuid;
     "network": "mainnet",
     "is_verified": true,
     "category": "DeFi",
-    "tags": ["yield", "optimization"],
+    "tags": [
+        {"id": "550e8400-e29b-41d4-a716-446655440005", "name": "yield", "color": "#888888"},
+        {"id": "550e8400-e29b-41d4-a716-446655440006", "name": "optimization", "color": "#888888"}
+    ],
     "created_at": "2023-10-27T10:00:00Z",
     "updated_at": "2023-10-27T10:00:00Z"
 }))]
@@ -37,7 +48,8 @@ pub struct Contract {
     /// Overall verification status for the contract (unverified, pending, verified, failed)
     pub verification_status: VerificationStatus,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub verified_at: Option<DateTime<Utc>>,
@@ -387,7 +399,7 @@ pub struct GraphNode {
     pub network: Network,
     pub is_verified: bool,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    pub tags: Vec<Tag>,
 }
 
 /// Graph edge (dependency relationship)
@@ -819,7 +831,7 @@ pub struct ContractMetadataExportRecord {
     pub network: String,
     pub is_verified: bool,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    pub tags: Vec<Tag>,
     pub maturity: Option<String>,
     pub health_score: i32,
     pub is_maintenance: bool,
@@ -2093,7 +2105,8 @@ pub struct TrendingContract {
     pub network: Network,
     pub is_verified: bool,
     pub category: Option<String>,
-    pub tags: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<Tag>,
     pub created_at: DateTime<Utc>,
     // Popularity metrics
     pub popularity_score: f64,
